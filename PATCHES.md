@@ -221,3 +221,18 @@ cross-compilation checks for Windows x86_64 GNU and macOS AArch64. Cross-compila
 execute native tests. The main-thread AppKit harness, Windows native message/IMM tests, live
 XIM/Wayland input methods, matching egui adapter and downstream custom editors remain separate
 qualification gates. Human review and merge are required.
+
+## W16 subset: native Wayland pinch
+
+PR #20 ports the pinch-only candidate from storytold/pdfcraft#1580 onto the resolved
+Craft fork. It optionally binds pointer-gestures-v1, converts cumulative compositor
+scales to logarithmic incremental `PinchGesture` deltas and cancels gestures on pointer
+or seat removal without replacing the newer drag/IME teardown. Rotation and swipe
+remain outside this cut. Remove the port when an upstream 0.30-compatible release
+provides equivalent pinch delivery and scale/lifecycle handling.
+
+Validation: 207 library tests and four `wayland_pinch` regressions passed with
+`--no-default-features --features wayland,rwh_06`; strict Clippy passed for the library
+and that test target. Current PdfCraft 0.16.1 also passed four egui integration tests
+with this port applied to its actual Git dependency. Live hardware validation was
+not repeated for this update.

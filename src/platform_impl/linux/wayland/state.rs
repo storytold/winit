@@ -31,8 +31,8 @@ use crate::platform_impl::wayland::clipboard::ClipboardState;
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
 use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::seat::{
-    PointerConstraintsState, RelativePointerState, TextInputState, WinitPointerData,
-    WinitPointerDataExt, WinitSeatState,
+    PointerConstraintsState, PointerGesturesState, RelativePointerState, TextInputState,
+    WinitPointerData, WinitPointerDataExt, WinitSeatState,
 };
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
 use crate::platform_impl::wayland::types::wp_fractional_scaling::FractionalScalingManager;
@@ -117,6 +117,9 @@ pub struct WinitState {
 
     /// Pointer constraints to handle pointer locking and confining.
     pub pointer_constraints: Option<Arc<PointerConstraintsState>>,
+
+    /// PdfCraft patch: optional Wayland pinch protocol; other compositors keep working.
+    pub pointer_gestures: Option<PointerGesturesState>,
 
     /// Viewporter state on the given window.
     pub viewporter_state: Option<ViewporterState>,
@@ -251,6 +254,7 @@ impl WinitState {
             viewporter_state,
             fractional_scaling_manager,
             kwin_blur_manager: KWinBlurManager::new(globals, queue_handle).ok(),
+            pointer_gestures: PointerGesturesState::new(globals, queue_handle).ok(),
 
             seats,
             text_input_state: TextInputState::new(globals, queue_handle).ok(),
