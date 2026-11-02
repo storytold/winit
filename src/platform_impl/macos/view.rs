@@ -22,7 +22,10 @@ use super::event::{
     code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
     scancode_to_physicalkey, KeyEventExtra,
 };
-use super::ime_document::{plain_insert, ImeDocument, PlainInsert};
+use super::ime_document::{
+    marked_subrange_rect_offset, plain_insert, utf16_marked_selection_and_utf8_range,
+    utf16_to_lossy_utf8, ImeDocument, PlainInsert,
+};
 use super::ime_startup::ImeStartup;
 use super::window::WinitWindow;
 use super::DEVICE_ID;
@@ -32,7 +35,8 @@ use crate::event::{
     WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
-use crate::platform::macos::{ImeDeleteSurrounding, OptionAsAlt};
+use crate::platform::macos::{ImeDeleteSurrounding, ImeTextChangeCause, OptionAsAlt};
+use crate::window::ImePurpose;
 
 #[derive(Debug)]
 struct CursorState {
@@ -132,6 +136,7 @@ pub struct ViewState {
     ///
     /// Can be set using `set_ime_allowed`
     ime_allowed: Cell<bool>,
+    ime_purpose: Cell<ImePurpose>,
     ime_reset_alive: Cell<bool>,
     native_ime_callbacks: Cell<usize>,
     pending_ime_resets: RefCell<VecDeque<u64>>,
@@ -142,6 +147,9 @@ pub struct ViewState {
 
     /// True while `keyDown:` runs `interpretKeyEvents`.
     in_key_down: Cell<bool>,
+
+    /// True if `marked_text` was non-empty when `keyDown:` began.
+    had_marked_in_key_down: Cell<bool>,
 
     /// True if the key being handled by `keyDown:` committed IME text.
     committed_in_key_down: Cell<bool>,
@@ -356,29 +364,17 @@ declare_class!(
             }
             self.ivars().pending_commit.set(true);
 
-            let cursor_range = if string.is_empty() {
-                self.ivars().marked_selection.set((0, 0));
-                // An empty string basically means that there's no preedit, so indicate that by
-                // sending a `None` cursor range.
-                None
-            } else {
-                // Clamp to string length to avoid NSRangeException from out-of-bounds
-                // indices sent by macOS IME (e.g. native Pinyin, see
-                // https://github.com/alacritty/alacritty/issues/8791).
-                let len = string.length();
-                let location = selected_range.location.min(len);
-                let end = selected_range.end().min(len);
-                self.ivars().marked_selection.set((location, end - location));
-                // Convert the selected range from UTF-16 indices to UTF-8 indices.
-                let sub_string_a = unsafe { string.substringToIndex(location) };
-                let sub_string_b = unsafe { string.substringToIndex(end) };
-                let lowerbound_utf8 = sub_string_a.len();
-                let upperbound_utf8 = sub_string_b.len();
-                Some((lowerbound_utf8, upperbound_utf8))
-            };
+            let units = ns_string_utf16_units(&string);
+            let (preedit_text, marked_sel, cursor_range) = utf16_marked_selection_and_utf8_range(
+                &units,
+                selected_range.location,
+                selected_range.length,
+                NSNotFound as NSUInteger,
+            );
+            self.ivars().marked_selection.set(marked_sel);
 
             // Send WindowEvent for updating marked text
-            self.queue_event(WindowEvent::Ime(Ime::Preedit(string.to_string(), cursor_range)));
+            self.queue_event(WindowEvent::Ime(Ime::Preedit(preedit_text, cursor_range)));
         }
 
         #[method(unmarkText)]
@@ -388,6 +384,7 @@ declare_class!(
             self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+            self.ivars().marked_selection.set((0, 0));
 
             if let Some(input_context) = self.inputContext() {
                 input_context.discardMarkedText();
@@ -420,8 +417,15 @@ declare_class!(
             actual_range: *mut NSRange,
         ) -> Option<Retained<NSAttributedString>> {
             trace_scope!("attributedSubstringForProposedRange:actualRange:");
-            let substring =
-                self.ivars().ime_document.borrow().substring((range.location, range.length));
+            let substring = (range.location != NSNotFound as NSUInteger)
+                .then(|| {
+                    let marked = ns_string_to_lossy_utf8(&self.ivars().marked_text.borrow().string());
+                    self.ivars()
+                        .ime_document
+                        .borrow()
+                        .substring_with_marked((range.location, range.length), &marked)
+                })
+                .flatten();
             substring.map(|(text, (location, length))| {
                 if !actual_range.is_null() {
                     unsafe { *actual_range = NSRange::new(location, length) };
@@ -439,8 +443,8 @@ declare_class!(
         #[method(firstRectForCharacterRange:actualRange:)]
         fn first_rect_for_character_range(
             &self,
-            _range: NSRange,
-            _actual_range: *mut NSRange,
+            range: NSRange,
+            actual_range: *mut NSRange,
         ) -> NSRect {
             trace_scope!("firstRectForCharacterRange:actualRange:");
 
@@ -449,8 +453,44 @@ declare_class!(
                 return NSRect::ZERO;
             };
 
+            let marked_ref = self.ivars().marked_text.borrow();
+            let marked_len = marked_ref.length();
+            let marked_str = if marked_len > 0 {
+                ns_string_to_lossy_utf8(&marked_ref.string())
+            } else {
+                String::new()
+            };
+            drop(marked_ref);
+
+            let requested =
+                (range.location != NSNotFound as NSUInteger).then_some((range.location, range.length));
+            let (clamped_loc, clamped_len) =
+                self.ivars().ime_document.borrow().clamp_character_range(requested, marked_len);
+            if !actual_range.is_null() {
+                unsafe { *actual_range = NSRange::new(clamped_loc, clamped_len) };
+            }
+
+            let mut pos = self.ivars().ime_position.get();
+            let mut size = self.ivars().ime_size.get();
+            if marked_len > 0 && requested.is_some() {
+                let caret = self.ivars().ime_document.borrow().caret();
+                let sel_loc = self.ivars().marked_selection.get().0;
+                let (dx, min_width) = marked_subrange_rect_offset(
+                    &marked_str,
+                    caret,
+                    sel_loc,
+                    (clamped_loc, clamped_len),
+                    size.height,
+                );
+                let bounds_w = self.bounds().size.width;
+                pos.x = (pos.x + dx).clamp(0.0, bounds_w.max(0.0));
+                if min_width > size.width {
+                    size.width = min_width;
+                }
+            }
+
             // Return value is expected to be in screen coordinates, so we need a conversion
-            let rect = NSRect::new(self.ivars().ime_position.get(), self.ivars().ime_size.get());
+            let rect = NSRect::new(pos, size);
             let view_rect = self.convertRect_toView(rect, None);
             window.convertRectToScreen(view_rect)
         }
@@ -465,11 +505,11 @@ declare_class!(
             let string = if string.is_kind_of::<NSAttributedString>() {
                 let string: *const NSObject = string;
                 let string: *const NSAttributedString = string.cast();
-                unsafe { &*string }.string().to_string()
+                ns_string_to_lossy_utf8(&unsafe { &*string }.string())
             } else {
                 let string: *const NSObject = string;
                 let string: *const NSString = string.cast();
-                unsafe { &*string }.to_string()
+                ns_string_to_lossy_utf8(unsafe { &*string })
             };
 
             self.ivars().ime_startup.borrow_mut().insert(&string);
@@ -495,6 +535,11 @@ declare_class!(
                 // Press-and-hold and dictation replace text they inserted before. Only the arms
                 // that deliver the text apply the replacement to `ime_document`.
                 let delete = self.replaced(replacement_range);
+                // Clear `marked_text` immediately before advancing `ime_document` so any follow-up
+                // `hasMarkedText` / `markedRange` / `attributedSubstringForProposedRange:` inside
+                // the same `interpretKeyEvents:` pass sees the committed caret with no stale mark.
+                *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                self.ivars().marked_selection.set((0, 0));
                 self.ivars().ime_document.borrow_mut().insert(&string);
                 self.queue_commit(string, delete);
                 // WordCraft patch: input methods also commit outside a key press (a candidate
@@ -502,12 +547,11 @@ declare_class!(
                 // and reset the state: the next key would be swallowed
                 // (rust-windowing/winit#4748).
                 if self.ivars().in_key_down.get() {
-                    // `keyDown:` clears the marked text and swallows the key that committed it.
+                    // `keyDown:` swallows the key that committed it unless forwarded as a command.
                     self.ivars().ime_state.set(ImeState::Committed);
                     self.ivars().committed_in_key_down.set(true);
                 } else {
                     // Committed outside a key press. No key to swallow.
-                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
                     self.ivars().ime_state.set(ImeState::Ground);
                 }
             } else {
@@ -517,9 +561,18 @@ declare_class!(
                 // backport of #4748). The same goes for text other than the key's that an input
                 // method types without a composition during a key press: Chinese punctuation
                 // (`，` for `,`), an ideographic space, an accent picked from the press-and-hold
-                // menu with a digit.
+                // menu with a digit, or a second `insertText` (such as `" "` on Space after `"한"`)
+                // when `committed_in_key_down` is already set and `KeyboardInput` will be dropped.
                 let key_characters = self.ivars().key_characters.borrow().clone();
                 match plain_insert(&string, key_characters.as_deref()) {
+                    PlainInsert::KeyText if self.ivars().committed_in_key_down.get() => {
+                        if self.ivars().ime_allowed.get() {
+                            let delete = self.replaced(replacement_range);
+                            self.notify_ime_enabled();
+                            self.ivars().ime_document.borrow_mut().insert(&string);
+                            self.queue_commit(string, delete);
+                        }
+                    },
                     PlainInsert::KeyText => {
                         let delete = self.replaced(replacement_range);
                         // The deletion goes before the key's `KeyboardInput`, which `keyDown:`
@@ -543,24 +596,53 @@ declare_class!(
                     // Dropped text leaves `ime_document` as it is.
                     PlainInsert::Commit | PlainInsert::Ignore => {},
                 }
+                if has_marked {
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.ivars().marked_selection.set((0, 0));
+                }
             }
         }
 
         // Basically, we're sent this message whenever a keyboard event that doesn't generate a "human
         // readable" character happens, i.e. newlines, tabs, and Ctrl+C.
         #[method(doCommandBySelector:)]
-        fn do_command_by_selector(&self, _command: Sel) {
+        fn do_command_by_selector(&self, command: Sel) {
             trace_scope!("doCommandBySelector:");
             self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
-            // We shouldn't forward any character from just committed text, since we'll end up sending
-            // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
-            // which is not desired given it was used to confirm IME input.
-            if self.ivars().ime_state.get() == ImeState::Committed {
+            // Do not forward a command while marked text remains after a commit in the same
+            // `keyDown:`. When `marked_text` was cleared by committing a syllable (e.g., Apple
+            // Korean committing `한` and then invoking `insertNewline:`, `insertTab:`, or
+            // `moveLeft:`), forward the command key so Enter/Tab/Arrows take effect immediately.
+            if unsafe { self.hasMarkedText() } && self.ivars().committed_in_key_down.get() {
                 return;
             }
 
-            // Commands such as arrows and Backspace move the caret or change the text.
+            // Pressing Escape (`cancelOperation:`) to cancel an active composition must only end
+            // the preedit, never forward `Escape` as a key press to dismiss dialogs or modes.
+            if command == sel!(cancelOperation:)
+                && (unsafe { self.hasMarkedText() }
+                    || (self.ivars().had_marked_in_key_down.get()
+                        && !self.ivars().committed_in_key_down.get()))
+            {
+                self.ivars().pending_commit.set(false);
+                if unsafe { self.hasMarkedText() } {
+                    if let Some(input_context) = self.inputContext() {
+                        input_context.discardMarkedText();
+                    }
+                    if unsafe { self.hasMarkedText() } {
+                        *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                        self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                    }
+                    self.ivars().marked_selection.set((0, 0));
+                }
+                if self.ivars().ime_state.get() == ImeState::Preedit {
+                    self.ivars().ime_state.set(ImeState::Ground);
+                }
+                return;
+            }
+
+            // Commands such as arrows, Enter, Tab, and Backspace move the caret or change the text.
             self.ivars().ime_document.borrow_mut().reset();
             self.ivars().forward_key_to_app.set(true);
 
@@ -582,6 +664,27 @@ declare_class!(
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
+                    let marked =
+                        ns_string_to_lossy_utf8(&self.ivars().marked_text.borrow().string());
+                    self.ivars().pending_commit.set(false);
+                    self.ivars().ime_startup.borrow_mut().reset();
+                    if !marked.is_empty() {
+                        if let Some(input_context) = self.inputContext() {
+                            input_context.discardMarkedText();
+                        }
+                        if self.ivars().marked_text.borrow().length() > 0 {
+                            *self.ivars().marked_text.borrow_mut() =
+                                NSMutableAttributedString::new();
+                            self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                        }
+                        self.ivars().marked_selection.set((0, 0));
+                        self.ivars().pending_commit.set(false);
+                        self.ivars().ime_document.borrow_mut().insert(&marked);
+                        self.queue_commit(marked, None);
+                    } else {
+                        *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                        self.ivars().marked_selection.set((0, 0));
+                    }
                     self.ivars().ime_state.set(ImeState::Disabled);
                     self.queue_event(WindowEvent::Ime(Ime::Disabled));
                 }
@@ -589,6 +692,8 @@ declare_class!(
 
             // Get the characters from the event.
             let old_ime_state = self.ivars().ime_state.get();
+            let had_marked_text = unsafe { self.hasMarkedText() };
+            self.ivars().had_marked_in_key_down.set(had_marked_text);
             self.ivars().forward_key_to_app.set(false);
             let event = replace_event(event, self.option_as_alt());
 
@@ -597,8 +702,9 @@ declare_class!(
             // ㅎㅏㄴ instead of 한. Retry that exact key once, synchronously, before it is sent
             // as `KeyboardInput`, and only in that case (rust-windowing/winit#4744; `ImeStartup`).
             let source = self.current_input_source();
-            let characters =
-                unsafe { event.characters() }.map(|s| s.to_string()).unwrap_or_default();
+            let characters = unsafe { event.characters() }
+                .map(|s| ns_string_to_lossy_utf8(&s))
+                .unwrap_or_default();
             let modifiers = event_mods(&event).state();
             let eligible = self.ivars().ime_allowed.get()
                 && old_ime_state == ImeState::Disabled
@@ -626,6 +732,12 @@ declare_class!(
             self.ivars().key_interpreted.set(false);
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                let doc_before = self
+                    .ivars()
+                    .ime_startup
+                    .borrow()
+                    .is_armed()
+                    .then(|| self.ivars().ime_document.borrow().clone());
                 self.ivars().in_key_down.set(true);
                 let outer_key = self.ivars().key_characters.replace(Some(characters));
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
@@ -638,6 +750,11 @@ declare_class!(
                     && self.ime_retry_has_focus();
                 let retry = self.ivars().ime_startup.borrow_mut().finish(serial, same_context);
                 if retry {
+                    if let Some(doc_before) = doc_before {
+                        *self.ivars().ime_document.borrow_mut() = doc_before;
+                    }
+                    self.ivars().ime_delete_surrounding.set(None);
+                    self.ivars().key_interpreted.set(false);
                     unsafe { self.interpretKeyEvents(&events_for_nsview) };
                 }
                 self.ivars().key_characters.replace(outer_key);
@@ -647,8 +764,10 @@ declare_class!(
                 if self.ivars().ime_state.get() == ImeState::Committed {
                     // Remove any marked text, so normal input can continue.
                     *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.ivars().marked_selection.set((0, 0));
                 }
             }
+            self.ivars().had_marked_in_key_down.set(false);
 
             self.update_modifiers(&event, false);
 
@@ -660,7 +779,10 @@ declare_class!(
                 }
                 ImeState::Preedit => true,
                 // `key_down` could result in preedit clear, so compare old and current state.
-                _ => old_ime_state != self.ivars().ime_state.get(),
+                _ => {
+                    old_ime_state != self.ivars().ime_state.get()
+                        || (had_marked_text && !unsafe { self.hasMarkedText() })
+                }
             };
             // WordCraft patch: a key whose text was committed through IME isn't sent again as
             // `KeyboardInput` (unless `doCommandBySelector` forwards it, as for Enter). Apple Korean
@@ -1007,11 +1129,13 @@ impl WinitView {
             input_source: Default::default(),
             pending_commit: Default::default(),
             ime_allowed: Default::default(),
+            ime_purpose: Default::default(),
             ime_reset_alive: Cell::new(true),
             native_ime_callbacks: Cell::new(0),
             pending_ime_resets: RefCell::new(VecDeque::new()),
             forward_key_to_app: Default::default(),
             in_key_down: Default::default(),
+            had_marked_in_key_down: Default::default(),
             committed_in_key_down: Default::default(),
             key_interpreted: Default::default(),
             key_characters: Default::default(),
@@ -1079,7 +1203,7 @@ impl WinitView {
     fn current_input_source(&self) -> String {
         self.inputContext()
             .and_then(|input_context| input_context.selectedKeyboardInputSource())
-            .map(|input_source| input_source.to_string())
+            .map(|input_source| ns_string_to_lossy_utf8(&input_source))
             .unwrap_or_default()
     }
 
@@ -1096,7 +1220,8 @@ impl WinitView {
     fn replaced(&self, range: NSRange) -> Option<ImeDeleteSurrounding> {
         let range =
             (range.location != NSNotFound as NSUInteger).then_some((range.location, range.length));
-        self.ivars().ime_document.borrow_mut().replace(range)
+        let marked_len = self.ivars().marked_text.borrow().length();
+        self.ivars().ime_document.borrow_mut().replace_with_marked(range, marked_len)
     }
 
     /// Queue `Ime::Commit(text)`. While the app handles it, `take_ime_delete_surrounding` returns
@@ -1154,6 +1279,7 @@ impl WinitView {
         }
         self.ivars().ime_allowed.set(ime_allowed);
         self.ivars().ime_startup.borrow_mut().reset();
+        self.ivars().ime_document.borrow_mut().clear_surrounding_text();
         self.ivars().ime_document.borrow_mut().reset();
         if self.ivars().ime_allowed.get() {
             return;
@@ -1173,6 +1299,7 @@ impl WinitView {
 
         // Clear markedText
         *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+        self.ivars().marked_selection.set((0, 0));
         self.ivars().pending_commit.set(false);
 
         if self.ivars().ime_state.get() != ImeState::Disabled {
@@ -1181,11 +1308,49 @@ impl WinitView {
         }
     }
 
+    pub(super) fn set_ime_purpose(&self, purpose: ImePurpose) {
+        self.ivars().ime_purpose.set(purpose);
+        if purpose == ImePurpose::Password {
+            self.clear_ime_surrounding_text();
+        }
+    }
+
+    pub(super) fn set_ime_surrounding_text_with_change_cause(
+        &self,
+        text: &str,
+        cursor: usize,
+        anchor: usize,
+        cause: ImeTextChangeCause,
+    ) {
+        if !self.ivars().ime_allowed.get() || self.ivars().ime_purpose.get() == ImePurpose::Password
+        {
+            return;
+        }
+        let has_marked = unsafe { self.hasMarkedText() };
+        self.ivars()
+            .ime_document
+            .borrow_mut()
+            .set_surrounding_text_with_marked(text, cursor, anchor, cause, has_marked);
+    }
+
+    pub(super) fn clear_ime_surrounding_text(&self) {
+        let had_synced = self.ivars().ime_document.borrow_mut().clear_surrounding_text();
+        if self.ivars().ime_allowed.get()
+            && (had_synced
+                || self.ivars().marked_text.borrow().length() > 0
+                || self.ivars().pending_commit.get())
+        {
+            self.ivars().ime_startup.borrow_mut().reset();
+            self.reset_ime();
+        }
+    }
+
     /// End the composition without committing it: the caret moved to other text.
     pub(super) fn reset_ime(&self) {
         self.ivars().ime_document.borrow_mut().reset();
         self.ivars().pending_commit.set(false);
         if self.ivars().marked_text.borrow().length() == 0 {
+            self.ivars().marked_selection.set((0, 0));
             return;
         }
         if let Some(input_context) = self.inputContext() {
@@ -1196,6 +1361,7 @@ impl WinitView {
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
         }
+        self.ivars().marked_selection.set((0, 0));
         if self.ivars().ime_state.get() == ImeState::Preedit {
             self.ivars().ime_state.set(ImeState::Ground);
         }
@@ -1442,6 +1608,19 @@ impl WinitView {
             position: view_point.to_physical(self.scale_factor()),
         });
     }
+}
+
+fn ns_string_utf16_units(s: &NSString) -> Vec<u16> {
+    let len = s.length();
+    let mut units = Vec::with_capacity(len);
+    for i in 0..len {
+        units.push(unsafe { s.characterAtIndex(i) });
+    }
+    units
+}
+
+fn ns_string_to_lossy_utf8(s: &NSString) -> String {
+    utf16_to_lossy_utf8(&ns_string_utf16_units(s))
 }
 
 /// Get the mouse button from the NSEvent.

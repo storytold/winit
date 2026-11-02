@@ -47,3 +47,8 @@ changelog entry.
 - On Wayland, add `ActiveEventLoopExtWayland::clipboard` and `platform::wayland::Clipboard`, which
   read and write text on the clipboard through winit's data device, so toolkits don't need to bind
   a second one.
+- On macOS, add `WindowExtMacOS::set_ime_surrounding_text`,
+  `WindowExtMacOS::set_ime_surrounding_text_with_change_cause`,
+  `WindowExtMacOS::clear_ime_surrounding_text`, and `platform::macos::ImeTextChangeCause` to keep
+  `NSTextInputClient` surrounding and marked UTF-16 ranges synchronized across 2-Set Korean
+  composition, Hanja conversion, and external edits.
