@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{
+    Axis, InputEvent, KeyAction, Keycode, MetaState, MotionAction, MotionEvent, Source,
+};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -18,6 +20,7 @@ use crate::error;
 use crate::error::EventLoopError;
 use crate::event::{self, Force, InnerSizeWriter, StartCause};
 use crate::event_loop::{self, ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents};
+use crate::keyboard::ModifiersState;
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::Fullscreen;
 use crate::window::{
@@ -131,6 +134,18 @@ impl RedrawRequester {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeyEventExtra {}
 
+/// The modifiers carried by an Android key or motion event. Android reports the state per event
+/// rather than tracking it globally, so its bits name the key side that changed the state; winit's
+/// state is side-free, and each side bit folds into the modifier it belongs to.
+fn android_modifiers(meta: MetaState) -> ModifiersState {
+    let mut state = ModifiersState::empty();
+    state.set(ModifiersState::SHIFT, meta.shift_on());
+    state.set(ModifiersState::CONTROL, meta.ctrl_on());
+    state.set(ModifiersState::ALT, meta.alt_on());
+    state.set(ModifiersState::SUPER, meta.meta_on());
+    state
+}
+
 pub struct EventLoop<T: 'static> {
     pub(crate) android_app: AndroidApp,
     window_target: event_loop::ActiveEventLoop,
@@ -143,6 +158,14 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
+    /// The modifier state last dispatched. winit 0.30 moved modifiers out of `KeyEvent` into
+    /// `WindowEvent::ModifiersChanged`, which this backend never sent, so on Android the state
+    /// reached nothing and every chord key read as plain text.
+    modifiers: ModifiersState,
+    /// The mouse buttons this press gesture has reported down, as [`Self::BUTTONS`] bits: `Down`
+    /// says which button started the gesture (Android reports *any* first button as `Down`, with
+    /// the button in the event's state), while the matching `Up` has already cleared that state.
+    mouse_buttons: Cell<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +178,75 @@ impl Default for PlatformSpecificEventLoopAttributes {
     fn default() -> Self {
         Self { android_app: Default::default(), ignore_volume_keys: true }
     }
+}
+
+/// One bit per button this backend reports, for [`EventLoop::mouse_buttons`].
+fn mouse_button_bit(button: event::MouseButton) -> u8 {
+    use event::MouseButton;
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Right => 1 << 1,
+        MouseButton::Middle => 1 << 2,
+        MouseButton::Back => 1 << 3,
+        MouseButton::Forward => 1 << 4,
+        MouseButton::Other(_) => 0,
+    }
+}
+
+/// The button Android reports as down in `motion_event`, if any: `Down` carries the gesture's
+/// starting button in the event's state (a touchpad tap has no button set).
+fn button_in_state(motion_event: &MotionEvent<'_>) -> Option<event::MouseButton> {
+    use event::MouseButton;
+    let state = motion_event.button_state();
+    if state.primary() {
+        Some(MouseButton::Left)
+    } else if state.secondary() {
+        Some(MouseButton::Right)
+    } else if state.teriary() {
+        Some(MouseButton::Middle)
+    } else if state.back() {
+        Some(MouseButton::Back)
+    } else if state.forward() {
+        Some(MouseButton::Forward)
+    } else {
+        None
+    }
+}
+
+/// The button a `ButtonPress`/`ButtonRelease` just changed, without Android's
+/// `AMotionEvent_getActionButton` (API 33+, and the one symbol whose unconditional reference
+/// made this library fail to load on older Android at all): the change is equally visible in
+/// the button *state* (`AMotionEvent_getButtonState`, every Android), which reflects it — a
+/// press lists the button, a release omits it — so the changed button is the one whose state
+/// disagrees with `reported`, the buttons we have already dispatched, filtered to the event's
+/// direction: a press only counts buttons the event lifts it into the state, a release only
+/// buttons it takes out, so a stale `reported` bit cannot name the button that did not move and
+/// swallow the one that did. `None` when there is
+/// nothing to change: the state matches exactly what we have reported (a first press doubled
+/// as a `ButtonPress`, or a release the `Up` handled first), and only buttons in the state
+/// beyond ours are skipped (stylus buttons, whose pointers never route here anyway).
+fn changed_button_in_state(
+    reported: u8,
+    pressed: bool,
+    motion_event: &MotionEvent<'_>,
+) -> Option<event::MouseButton> {
+    use event::MouseButton;
+    let state = motion_event.button_state();
+    [
+        (state.primary(), MouseButton::Left),
+        (state.secondary(), MouseButton::Right),
+        (state.teriary(), MouseButton::Middle),
+        (state.back(), MouseButton::Back),
+        (state.forward(), MouseButton::Forward),
+    ]
+    .into_iter()
+    .find(|(down, button)| {
+        // Only buttons moving in the event's direction count: after a missed release a stale
+        // `reported` bit could otherwise name the button that did not move and swallow the one
+        // that did (a second finger's press, or a release the first `Up` did not cover).
+        pressed == *down && *down != (reported & mouse_button_bit(*button) != 0)
+    })
+    .map(|(_, button)| button)
 }
 
 impl<T: 'static> EventLoop<T> {
@@ -192,6 +284,8 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
+            modifiers: ModifiersState::empty(),
+            mouse_buttons: Cell::new(0),
         })
     }
 
@@ -241,6 +335,25 @@ impl<T: 'static> EventLoop<T> {
                         },
                         self.window_target(),
                     );
+                    // A button the pointer held into losing the window (a system gesture, the
+                    // app switcher) never sees its `Up`: release the buttons, or egui keeps
+                    // the drag going and their next press reports nothing (`set_mouse_button`
+                    // sees no change). The device id is unknown here, and egui does not key
+                    // pressed buttons on it.
+                    let device_id = event::DeviceId(DeviceId(0));
+                    for button in self.take_mouse_buttons() {
+                        callback(
+                            event::Event::WindowEvent {
+                                window_id: window::WindowId(WindowId),
+                                event: event::WindowEvent::MouseInput {
+                                    device_id,
+                                    state: event::ElementState::Released,
+                                    button,
+                                },
+                            },
+                            self.window_target(),
+                        );
+                    }
                 },
                 MainEvent::ConfigChanged { .. } => {
                     let monitor = MonitorHandle::new(self.android_app.clone());
@@ -377,6 +490,16 @@ impl<T: 'static> EventLoop<T> {
                 let window_id = window::WindowId(WindowId);
                 let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
 
+                // A mouse or trackpad reports its wheel (`Scroll`), its right and middle
+                // buttons (`ButtonPress`/`ButtonRelease`) and its unpressed movement
+                // (`HoverMove`) through their own actions, which the `Touch` mapping below
+                // cannot express — stock winit drops them, leaving a mouse with no hover, no
+                // wheel and no right-click. Touchscreen and touch-dragged stylus pointers keep
+                // the `Touch` path unchanged.
+                if matches!(motion_event.source(), Source::Mouse | Source::Touchpad) {
+                    return self.dispatch_mouse_input(window_id, device_id, motion_event, callback);
+                }
+
                 let phase = match motion_event.action() {
                     MotionAction::Down | MotionAction::PointerDown => {
                         Some(event::TouchPhase::Started)
@@ -434,6 +557,22 @@ impl<T: 'static> EventLoop<T> {
                         input_status = InputStatus::Unhandled
                     },
                     keycode => {
+                        // Android carries the modifiers inside the key event, so the change has to
+                        // be dispatched *before* the key event it belongs to: consumers read the
+                        // state as they convert a key, so a chord key arriving first is converted
+                        // as plain text. Only a real change is dispatched, so an idle device keeps
+                        // producing no events and the app can idle (storytold/effectcraft#2359).
+                        let modifiers = android_modifiers(key.meta_state());
+                        if modifiers != self.modifiers {
+                            self.modifiers = modifiers;
+                            callback(
+                                event::Event::WindowEvent {
+                                    window_id: window::WindowId(WindowId),
+                                    event: event::WindowEvent::ModifiersChanged(modifiers.into()),
+                                },
+                                self.window_target(),
+                            );
+                        }
                         let state = match key.action() {
                             KeyAction::Down => event::ElementState::Pressed,
                             KeyAction::Up => event::ElementState::Released,
@@ -479,6 +618,168 @@ impl<T: 'static> EventLoop<T> {
         }
 
         input_status
+    }
+
+    /// Report a mouse or trackpad [`MotionEvent`] as the mouse events the device actually
+    /// produced: wheel notches as `MouseWheel`, each button of a press or release as
+    /// `MouseInput`, and every movement — pressed or hovering — as `CursorMoved`.
+    ///
+    /// This is the whole of the delta over upstream winit 0.30.13, whose Android backend only
+    /// ever emits `Touch` events (with a `// TODO mouse events` where these actions were meant
+    /// to be handled); see this crate's README in FilmCraft's `third_party/winit`.
+    fn dispatch_mouse_input<F>(
+        &self,
+        window_id: window::WindowId,
+        device_id: event::DeviceId,
+        motion_event: &MotionEvent<'_>,
+        callback: &mut F,
+    ) -> InputStatus
+    where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        use event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+
+        let mut dispatch = |window_event: WindowEvent| {
+            callback(
+                event::Event::WindowEvent { window_id, event: window_event },
+                self.window_target(),
+            );
+        };
+        // The pointer's position and scroll axes, for the events that carry them. A mouse is
+        // a single pointer, and both android-activity backends expose the axes on it.
+        let pointer = motion_event.pointers().next();
+        let position = pointer.as_ref().map(|p| PhysicalPosition { x: p.x() as _, y: p.y() as _ });
+
+        match motion_event.action() {
+            MotionAction::Scroll => {
+                // One wheel notch is one scroll unit. Android's vertical axis points the same way
+                // as winit's convention (positive = the content moves down, i.e. `MouseWheel`
+                // "up"), but its horizontal axis is the other way round: a positive
+                // `AXIS_HSCROLL` scrolls the viewport right, moving the content left, where a
+                // positive winit `LineDelta` x moves the content right.
+                let (h, v) = match &pointer {
+                    Some(p) => (-p.axis_value(Axis::Hscroll), p.axis_value(Axis::Vscroll)),
+                    None => (0.0, 0.0),
+                };
+                let delta = MouseScrollDelta::LineDelta(h, v);
+                dispatch(WindowEvent::MouseWheel { device_id, delta, phase: TouchPhase::Moved });
+            },
+            MotionAction::ButtonPress | MotionAction::ButtonRelease => {
+                // A button going down or up while a gesture is under way. The button that starts
+                // the gesture arrives as `Down`/`Up` instead (below); some devices report that
+                // first press here as well, which must not become a second press (egui would see
+                // two `Pressed` with no release between).
+                if let Some(position) = position {
+                    dispatch(WindowEvent::CursorMoved { device_id, position });
+                }
+                let pressed = motion_event.action() == MotionAction::ButtonPress;
+                // The changed button is read from the button *state* against what we have
+                // reported rather than from Android's `AMotionEvent_getActionButton`: that
+                // symbol exists only from API 33, and a static reference to it stops the whole
+                // library loading on older devices (`dlopen failed: cannot locate symbol`, seen
+                // as an Android 12 tablet failing with `UnsatisfiedLinkError`). `None` means the
+                // state already matches what we reported: nothing changed (the doubled first
+                // press, or a release an `Up` has already handled), and nothing is dispatched.
+                let Some(button) =
+                    changed_button_in_state(self.mouse_buttons.get(), pressed, motion_event)
+                else {
+                    return InputStatus::Handled;
+                };
+                if self.set_mouse_button(button, pressed) {
+                    let state =
+                        if pressed { ElementState::Pressed } else { ElementState::Released };
+                    dispatch(WindowEvent::MouseInput { device_id, state, button });
+                }
+            },
+            MotionAction::Down | MotionAction::Up => {
+                if let Some(position) = position {
+                    dispatch(WindowEvent::CursorMoved { device_id, position });
+                }
+                if motion_event.action() == MotionAction::Down {
+                    // Android reports the *first* button of a gesture as an ordinary down, with
+                    // the button itself in the event's state (a touchpad tap sets none, and is a
+                    // primary click).
+                    let button = button_in_state(motion_event).unwrap_or(MouseButton::Left);
+                    if self.set_mouse_button(button, true) {
+                        dispatch(WindowEvent::MouseInput {
+                            device_id,
+                            state: ElementState::Pressed,
+                            button,
+                        });
+                    }
+                } else {
+                    // `Up` has already cleared the button state, so release what the gesture
+                    // reported down. A device that sent a `ButtonRelease` for it cleared that bit
+                    // already, and this then releases nothing.
+                    for button in self.take_mouse_buttons() {
+                        dispatch(WindowEvent::MouseInput {
+                            device_id,
+                            state: ElementState::Released,
+                            button,
+                        });
+                    }
+                }
+            },
+            MotionAction::Move | MotionAction::HoverMove => {
+                if let Some(position) = position {
+                    dispatch(WindowEvent::CursorMoved { device_id, position });
+                }
+            },
+            MotionAction::HoverEnter => {
+                dispatch(WindowEvent::CursorEntered { device_id });
+                if let Some(position) = position {
+                    dispatch(WindowEvent::CursorMoved { device_id, position });
+                }
+            },
+            MotionAction::HoverExit => dispatch(WindowEvent::CursorLeft { device_id }),
+            MotionAction::Cancel => {
+                // The system took the gesture over (home, the notification shade, another
+                // activity, ...): its buttons end here without an `Up`, and must not stay
+                // reported down — a later press would dispatch nothing (`set_mouse_button`
+                // sees no change of state).
+                for button in self.take_mouse_buttons() {
+                    dispatch(WindowEvent::MouseInput {
+                        device_id,
+                        state: ElementState::Released,
+                        button,
+                    });
+                }
+            },
+            // Nothing else a mouse reports needs translating here (pointer-id actions belong
+            // to touch).
+            _ => return InputStatus::Unhandled,
+        }
+        InputStatus::Handled
+    }
+
+    /// Record `button` as down (or up) and answer whether that changed anything. A device that
+    /// reports the gesture's first press as both `Down` and `ButtonPress` therefore reports it
+    /// once, and a release only reports for a button this gesture pressed.
+    fn set_mouse_button(&self, button: event::MouseButton, pressed: bool) -> bool {
+        let bit = mouse_button_bit(button);
+        if bit == 0 {
+            return true;
+        }
+        let current = self.mouse_buttons.get();
+        let next = if pressed { current | bit } else { current & !bit };
+        self.mouse_buttons.set(next);
+        next != current
+    }
+
+    /// Every button the gesture has down, clearing the set.
+    fn take_mouse_buttons(&self) -> Vec<event::MouseButton> {
+        use event::MouseButton;
+        let held = self.mouse_buttons.replace(0);
+        [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ]
+        .into_iter()
+        .filter(|button| held & mouse_button_bit(*button) != 0)
+        .collect()
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>
