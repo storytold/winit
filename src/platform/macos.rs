@@ -173,6 +173,38 @@ pub trait WindowExtMacOS {
     /// Getter for the [`WindowExtMacOS::set_borderless_game`].
     fn is_borderless_game(&self) -> bool;
 
+    /// Tells the input method the text around the cursor of the focused text field, so it can
+    /// query context and replace surrounding characters through `NSTextInputClient`.
+    ///
+    /// `cursor` and `anchor` are UTF-8 byte offsets into `text`, the other end of the selection
+    /// being `anchor`; without a selection they are equal. Leave the preedit out of `text`.
+    /// Offsets are clamped to `text` and moved back to a character boundary.
+    ///
+    /// This is the application-originated setter: it reports [`ImeTextChangeCause::Other`]. Use
+    /// [`Self::set_ime_surrounding_text_with_change_cause`] when the change was caused by applying
+    /// an IME commit or deletion.
+    fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize) {
+        self.set_ime_surrounding_text_with_change_cause(
+            text,
+            cursor,
+            anchor,
+            ImeTextChangeCause::Other,
+        );
+    }
+
+    /// Like [`Self::set_ime_surrounding_text`], but also carries the reason for the change.
+    fn set_ime_surrounding_text_with_change_cause(
+        &self,
+        text: &str,
+        cursor: usize,
+        anchor: usize,
+        cause: ImeTextChangeCause,
+    );
+
+    /// Forgets the synced surrounding text and returns to local typed-prefix tracking without
+    /// changing whether IME is allowed.
+    fn clear_ime_surrounding_text(&self);
+
     /// The text to delete before inserting the [`Ime::Commit`] being handled.
     ///
     /// Call this when handling each `Ime::Commit`, after removing the preedit and before
@@ -184,6 +216,16 @@ pub trait WindowExtMacOS {
     ///
     /// [`Ime::Commit`]: crate::event::Ime::Commit
     fn take_ime_delete_surrounding(&self) -> Option<ImeDeleteSurrounding>;
+}
+
+/// Reason for a change to the text reported to the input method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ImeTextChangeCause {
+    /// The change was caused by the input method itself.
+    #[default]
+    InputMethod,
+    /// The change came from another source (typing, mouse selection, application state update).
+    Other,
 }
 
 /// Text an input method asks to delete around the cursor, in bytes of UTF-8 text.
@@ -277,6 +319,24 @@ impl WindowExtMacOS for Window {
     #[inline]
     fn is_borderless_game(&self) -> bool {
         self.window.maybe_wait_on_main(|w| w.is_borderless_game())
+    }
+
+    #[inline]
+    fn set_ime_surrounding_text_with_change_cause(
+        &self,
+        text: &str,
+        cursor: usize,
+        anchor: usize,
+        cause: ImeTextChangeCause,
+    ) {
+        self.window.maybe_wait_on_main(|w| {
+            w.set_ime_surrounding_text_with_change_cause(text, cursor, anchor, cause)
+        })
+    }
+
+    #[inline]
+    fn clear_ime_surrounding_text(&self) {
+        self.window.maybe_wait_on_main(|w| w.clear_ime_surrounding_text())
     }
 
     #[inline]

@@ -222,3 +222,20 @@ cross-compilation checks for Windows x86_64 GNU and macOS AArch64. Cross-compila
 execute native tests. The main-thread AppKit harness, Windows native message/IMM tests, live
 XIM/Wayland input methods, matching egui adapter and downstream custom editors remain separate
 qualification gates. Human review and merge are required.
+
+## macOS NSTextInputClient surrounding-text and marked-text sync
+
+`WindowExtMacOS` exposes `set_ime_surrounding_text`, `set_ime_surrounding_text_with_change_cause`,
+`clear_ime_surrounding_text` and `ImeTextChangeCause`, matching `WindowExtWayland`. `ImeDocument`
+projects a virtual UTF-16 buffer combining `before`, live `marked` text and `after` so Apple's
+2-Set Korean input method (`com.apple.inputmethod.Korean.2SetKorean`) sees accurate
+`selectedRange`, `markedRange` and `attributedSubstringForProposedRange` offsets across syllable
+transitions and `insertText:replacementRange:` recompositions.
+
+Application-originated updates (`ImeTextChangeCause::Other`, including suffix-shrinking edits)
+call `NSTextInputContext::discardMarkedText`, clear stale marked state and fence stale UTF-16
+replacement offsets so a subsequent key press cannot delete text at the new caret. Cold-start
+Korean jamo retry snapshots preserve ordering before the first key event, `firstRectForCharacterRange`
+offsets sub-ranges inside marked text for the Hanja candidate popup, `cancelOperation:` suppresses
+duplicate Escape text emission when cancelling a composition, and Objective-C UTF-16 conversions
+use lossy decoding at the FFI boundary.

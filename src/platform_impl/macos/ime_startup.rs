@@ -34,6 +34,10 @@ impl ImeStartup {
         self.serial
     }
 
+    pub fn is_armed(&self) -> bool {
+        self.batch.is_some()
+    }
+
     pub fn insert(&mut self, text: &str) {
         if let Some(batch) = &mut self.batch {
             let mut chars = text.chars();
@@ -155,5 +159,29 @@ mod tests {
         s.insert("ㅎ");
         s.reset();
         assert!(!s.finish(id, true));
+    }
+    #[test]
+    fn armed_flag_tracks_pending_cold_korean_jamo_batch() {
+        let mut s = ImeStartup::default();
+        assert!(!s.is_armed());
+        let serial = s.begin(KO, "ㅎ", true);
+        assert!(s.is_armed());
+        s.insert("ㅎ");
+        assert!(s.is_armed());
+        assert!(s.finish(serial, true));
+        assert!(!s.is_armed());
+
+        // Subsequent key on warmed Korean source is not armed until reset or source switch.
+        let serial2 = s.begin(KO, "ㅏ", true);
+        assert!(!s.is_armed());
+        assert!(!s.finish(serial2, true));
+
+        // Reset (e.g., Caps Lock input-source toggle) re-arms the next cold Korean jamo.
+        s.reset();
+        let serial3 = s.begin(KO, "ㄱ", true);
+        assert!(s.is_armed());
+        s.other_callback();
+        assert!(!s.is_armed());
+        assert!(!s.finish(serial3, true));
     }
 }

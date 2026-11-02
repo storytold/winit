@@ -36,7 +36,9 @@ use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId};
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{InnerSizeWriter, WindowEvent};
-use crate::platform::macos::{ImeDeleteSurrounding, OptionAsAlt, WindowExtMacOS};
+use crate::platform::macos::{
+    ImeDeleteSurrounding, ImeTextChangeCause, OptionAsAlt, WindowExtMacOS,
+};
 use crate::window::{
     Cursor, CursorGrabMode, Icon, ImePurpose, ResizeDirection, Theme, UserAttentionType,
     WindowAttributes, WindowButtons, WindowLevel,
@@ -1569,7 +1571,9 @@ impl WindowDelegate {
     }
 
     #[inline]
-    pub fn set_ime_purpose(&self, _purpose: ImePurpose) {}
+    pub fn set_ime_purpose(&self, purpose: ImePurpose) {
+        self.view().set_ime_purpose(purpose);
+    }
 
     #[inline]
     pub fn reset_ime(&self) {
@@ -1878,6 +1882,20 @@ impl WindowExtMacOS for WindowDelegate {
 
     fn is_borderless_game(&self) -> bool {
         self.ivars().is_borderless_game.get()
+    }
+
+    fn set_ime_surrounding_text_with_change_cause(
+        &self,
+        text: &str,
+        cursor: usize,
+        anchor: usize,
+        cause: ImeTextChangeCause,
+    ) {
+        self.view().set_ime_surrounding_text_with_change_cause(text, cursor, anchor, cause);
+    }
+
+    fn clear_ime_surrounding_text(&self) {
+        self.view().clear_ime_surrounding_text();
     }
 
     fn take_ime_delete_surrounding(&self) -> Option<ImeDeleteSurrounding> {

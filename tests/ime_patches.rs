@@ -787,6 +787,36 @@ pub struct ImeDeleteSurrounding {
     pub after_bytes: usize,
 }
 
+/// `winit::platform::macos::ImeTextChangeCause`, which only macOS builds have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ImeTextChangeCause {
+    #[default]
+    InputMethod,
+    Other,
+}
+
+pub mod platform {
+    pub mod macos {
+        pub use crate::ImeTextChangeCause;
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn macos_surrounding_text_is_public(window: &winit::window::Window) {
+    use winit::platform::macos::{ImeTextChangeCause, WindowExtMacOS};
+    window.set_ime_surrounding_text("한글", 3, 3);
+    window.set_ime_surrounding_text_with_change_cause(
+        "한글",
+        3,
+        3,
+        ImeTextChangeCause::InputMethod,
+    );
+    window.set_ime_surrounding_text_with_change_cause("한글", 3, 3, ImeTextChangeCause::Other);
+    window.clear_ime_surrounding_text();
+    let _ = window.take_ime_delete_surrounding();
+}
+
 #[test]
 fn macos_first_apple_korean_key_is_retried_once() {
     // On the first key in a freshly started app, Apple Korean can answer with `insertText` and the
@@ -806,6 +836,245 @@ fn macos_first_apple_korean_key_is_retried_once() {
         insert_text.contains("self.ivars().ime_startup.borrow_mut().insert(&string);"),
         "insertText doesn't report to the retry policy"
     );
+}
+
+#[test]
+fn macos_insert_text_clears_marked_text_and_commits_trailing_key_text() {
+    // F-01 (W-01): committing in `insertText` must clear `marked_text` immediately before
+    // advancing `ime_document` so follow-up `hasMarkedText` / `markedRange` / substring queries in
+    // the same `interpretKeyEvents:` pass see no stale mark, and a second `insertText` (e.g. `" "`
+    // after `"한"`) while `committed_in_key_down` is set must commit via `queue_commit` instead of
+    // mutating `ime_document` silently while `key_down` drops `KeyboardInput`.
+    let view = source("macos/view.rs");
+    let insert_text = view_method(&view, "fn insert_text(");
+    let commit_branch = section(
+        insert_text,
+        "if pending_commit && ime_enabled && !is_control {",
+        "\n            } else {",
+    );
+    let clear_mark = commit_branch
+        .find("*self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();")
+        .expect("commit branch doesn't clear marked_text immediately");
+    let advance_doc = commit_branch
+        .find("self.ivars().ime_document.borrow_mut().insert(&string);")
+        .expect("commit branch doesn't advance ime_document");
+    assert!(
+        clear_mark < advance_doc,
+        "marked_text must be cleared before advancing ime_document on commit"
+    );
+    assert!(
+        insert_text
+            .contains("PlainInsert::KeyText if self.ivars().committed_in_key_down.get() => {")
+            && insert_text.contains("self.queue_commit(string, delete);"),
+        "trailing plain KeyText in the same keyDown after a commit isn't committed"
+    );
+}
+
+#[test]
+fn macos_cold_korean_key_retry_rolls_back_ime_document() {
+    // F-02 (W-02): pass #1 of cold first Korean jamo inserts compatibility jamo into `ime_document`
+    // via `PlainInsert::KeyText`. When `ImeStartup::finish` returns `retry == true`, `key_down`
+    // must restore `ime_document` to its pre-pass snapshot before pass #2 runs.
+    let view = source("macos/view.rs");
+    let key_down = view_method(&view, "fn key_down(");
+    let snapshot = key_down
+        .find("let doc_before =")
+        .expect("key_down doesn't snapshot ime_document before interpretKeyEvents");
+    let first_interpret = key_down
+        .find("unsafe { self.interpretKeyEvents(&events_for_nsview) };")
+        .expect("key_down doesn't call interpretKeyEvents");
+    assert!(snapshot < first_interpret, "snapshot must precede first interpretKeyEvents");
+    let retry_block = section(key_down, "if retry {", "\n                }\n");
+    assert!(
+        retry_block.contains("*self.ivars().ime_document.borrow_mut() = doc_before;"),
+        "retry block doesn't restore ime_document snapshot"
+    );
+
+    // End-to-end simulation with `ImeStartup` + `ImeDocument`:
+    // "abc" -> cold "ㅎ" pass #1 -> retry rollback -> "한" -> replacement deletes "한" (3 bytes),
+    // NEVER eating "abc"!
+    let mut doc = ime_document::ImeDocument::default();
+    doc.insert("abc");
+    let mut startup = ime_startup::ImeStartup::default();
+    let ko = "com.apple.inputmethod.Korean.2SetKorean";
+    let serial = startup.begin(ko, "ㅎ", true);
+    let doc_before = startup.is_armed().then(|| doc.clone());
+
+    // Pass #1: cold fallback inserts "ㅎ" as KeyText.
+    startup.insert("ㅎ");
+    doc.insert("ㅎ");
+    assert_eq!(doc.caret(), 4);
+
+    // Retry fires: roll back `doc` before pass #2.
+    assert!(startup.finish(serial, true));
+    doc = doc_before.expect("startup was armed");
+    assert_eq!(doc.caret(), 3);
+
+    // Pass #2 composes and commits "한", then replaces "한".
+    startup.other_callback();
+    doc.insert("한");
+    assert_eq!(
+        doc.replace(Some((3, 1))),
+        Some(ImeDeleteSurrounding { before_bytes: "한".len(), after_bytes: 0 })
+    );
+    assert_eq!(doc.substring((0, 10)), Some(("abc".to_owned(), (0, 3))));
+}
+
+#[test]
+fn macos_surrounding_text_and_virtual_buffer_plumbing() {
+    // F-03 (W-03 + Contract 1): `WindowExtMacOS` exposes surrounding-text setters and clear,
+    // `WindowDelegate` forwards them to `WinitView`, and `attributedSubstringForProposedRange:`
+    // queries `substring_with_marked` with the live `marked_text`.
+    let public = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform/macos.rs"),
+    )
+    .expect("platform/macos.rs is readable");
+    assert!(
+        public.contains("pub enum ImeTextChangeCause")
+            && public.contains(
+                "fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize)"
+            )
+            && public.contains("fn set_ime_surrounding_text_with_change_cause(")
+            && public.contains("fn clear_ime_surrounding_text(&self);"),
+        "WindowExtMacOS surrounding-text contract is incomplete"
+    );
+
+    let delegate = source("macos/window_delegate.rs");
+    assert!(
+        delegate.contains(
+            "self.view().set_ime_surrounding_text_with_change_cause(text, cursor, anchor, cause);"
+        ) && delegate.contains("self.view().clear_ime_surrounding_text();"),
+        "WindowDelegate doesn't forward surrounding-text calls to WinitView"
+    );
+
+    let view = source("macos/view.rs");
+    let attr_sub = view_method(&view, "fn attributed_substring_for_proposed_range(");
+    assert!(
+        attr_sub.contains("substring_with_marked((range.location, range.length), &marked)"),
+        "attributedSubstringForProposedRange doesn't include marked_text in the virtual buffer"
+    );
+    let clear_fn = section(&view, "pub(super) fn clear_ime_surrounding_text(", "\n    }\n");
+    assert!(
+        clear_fn.contains("self.ivars().ime_allowed.get()")
+            && clear_fn.contains("self.reset_ime();"),
+        "clear_ime_surrounding_text must cancel active compositions only while ime_allowed is true"
+    );
+}
+
+#[test]
+fn macos_input_source_switch_commits_and_discards_marked_text() {
+    // F-04 (W-04): toggling Korean <-> English (Caps Lock / Ctrl+Space) while `marked_text` is
+    // non-empty must discard native marked text, clear preedit, commit the pending syllable, and
+    // reset `pending_commit` + `ime_startup` before emitting `Ime::Disabled`.
+    let view = source("macos/view.rs");
+    let key_down = view_method(&view, "fn key_down(");
+    let switch_block = section(
+        key_down,
+        "if *prev_input_source != current_input_source && self.is_ime_enabled() {",
+        "self.queue_event(WindowEvent::Ime(Ime::Disabled));",
+    );
+    assert!(
+        switch_block.contains("input_context.discardMarkedText();")
+            && switch_block.contains("self.queue_commit(marked, None);")
+            && switch_block.contains("self.ivars().pending_commit.set(false);")
+            && switch_block.contains("self.ivars().ime_startup.borrow_mut().reset();"),
+        "input-source switch in keyDown doesn't flush and clean up active marked_text"
+    );
+}
+
+#[test]
+fn macos_commands_after_ime_commit_forward_to_app_while_escape_cancels_preedit() {
+    // F-05 (W-05): when AppleKorean commits `한` (clearing `marked_text`) and invokes
+    // `doCommandBySelector:` (`insertNewline:`, `insertTab:`, `moveLeft:`) in the same `keyDown:`,
+    // `do_command_by_selector` must set `forward_key_to_app` instead of returning early on
+    // `ImeState::Committed`. Pressing Escape (`cancelOperation:`) during active preedit cancels
+    // the preedit without forwarding Escape to the app.
+    let view = source("macos/view.rs");
+    let do_cmd = view_method(&view, "fn do_command_by_selector(");
+    assert!(
+        !do_cmd.contains("self.ivars().ime_state.get() == ImeState::Committed"),
+        "doCommandBySelector still drops Enter/Tab/Arrows after an IME commit"
+    );
+    assert!(
+        do_cmd.contains(
+            "if unsafe { self.hasMarkedText() } && self.ivars().committed_in_key_down.get()"
+        ) && do_cmd.contains("command == sel!(cancelOperation:)")
+            && do_cmd.contains("self.ivars().forward_key_to_app.set(true);"),
+        "doCommandBySelector missing post-commit forwarding or Escape preedit guard"
+    );
+}
+
+#[test]
+fn macos_first_rect_writes_actual_range_and_adjusts_marked_subrange() {
+    // F-06 (W-06): `firstRectForCharacterRange:actualRange:` writes clamped `actualRange` when
+    // non-null and offsets sub-ranges inside `markedRange` for Hanja candidate alignment.
+    let view = source("macos/view.rs");
+    let first_rect = view_method(&view, "fn first_rect_for_character_range(");
+    assert!(
+        first_rect.contains("if !actual_range.is_null() {")
+            && first_rect.contains("clamp_character_range(")
+            && first_rect.contains("marked_subrange_rect_offset("),
+        "firstRectForCharacterRange doesn't write clamped actualRange or marked sub-range offset"
+    );
+}
+
+#[test]
+fn macos_external_other_edit_suffix_shrink_and_lossy_utf16_ffi_guards() {
+    // F-CHAL-1: external `Other` edit shrinking `"가한"` -> `"한"` without active marked text
+    // advances `start` past the old virtual buffer so stale UTF-16 range `(1, 1)` returns `None`.
+    let mut doc = ime_document::ImeDocument::default();
+    doc.set_surrounding_text("가한", "가한".len(), "가한".len(), ImeTextChangeCause::Other);
+    doc.set_surrounding_text("한", "한".len(), "한".len(), ImeTextChangeCause::Other);
+    assert_eq!(doc.replace_with_marked(Some((1, 1)), 0), None);
+    assert_eq!(
+        doc.replace_with_marked(Some((2, 1)), 0),
+        Some(ImeDeleteSurrounding { before_bytes: "한".len(), after_bytes: 0 })
+    );
+
+    // Blocker 2 + F-CHAL-2A/2B: Objective-C callbacks in `view.rs` must never call
+    // `NSString::to_string()`, `selected_range.end()`, or `substringToIndex`, which can panic or
+    // pass a NULL `UTF8String` pointer across `extern "C"`.
+    let view = source("macos/view.rs");
+    assert!(
+        !view.contains(".to_string()")
+            && !view.contains("selected_range.end()")
+            && !view.contains("substringToIndex"),
+        "macos/view.rs still uses panic-prone NSString::to_string, NSRange::end, or substringToIndex"
+    );
+    let set_marked = view_method(&view, "fn set_marked_text(");
+    assert!(
+        set_marked.contains("utf16_marked_selection_and_utf8_range("),
+        "set_marked_text doesn't use utf16_marked_selection_and_utf8_range"
+    );
+
+    // Pure UTF-16 helper invariants on NSNotFound, usize::MAX, surrogate interiors, and unpaired surrogates.
+    let not_found = isize::MAX as usize;
+    let ko: Vec<u16> = "한글".encode_utf16().collect();
+    assert_eq!(
+        ime_document::utf16_marked_selection_and_utf8_range(&ko, not_found, 1, not_found),
+        ("한글".to_owned(), (2, 0), Some((6, 6)))
+    );
+    assert_eq!(
+        ime_document::utf16_marked_selection_and_utf8_range(&ko, 1, usize::MAX, not_found),
+        ("한글".to_owned(), (1, 1), Some((3, 6)))
+    );
+    assert_eq!(
+        ime_document::utf16_marked_selection_and_utf8_range(&ko, usize::MAX, usize::MAX, not_found),
+        ("한글".to_owned(), (2, 0), Some((6, 6)))
+    );
+
+    let emoji_ko: Vec<u16> = "😀한".encode_utf16().collect();
+    assert_eq!(
+        ime_document::utf16_marked_selection_and_utf8_range(&emoji_ko, 1, 0, not_found),
+        ("😀한".to_owned(), (0, 0), Some((0, 0)))
+    );
+    assert_eq!(
+        ime_document::utf16_marked_selection_and_utf8_range(&emoji_ko, 1, 1, not_found),
+        ("😀한".to_owned(), (0, 2), Some((0, 4)))
+    );
+
+    assert_eq!(ime_document::utf16_to_lossy_utf8(&[0xd83d, 0xd55c]), "\u{FFFD}한");
+    assert_eq!(ime_document::utf16_to_lossy_utf8(&[0xdc00]), "\u{FFFD}");
 }
 
 // `SystemCaret` is plain Rust, so its policy tests run on every platform.
