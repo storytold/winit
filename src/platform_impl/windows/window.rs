@@ -27,8 +27,7 @@ use windows_sys::Win32::System::Com::{
 use windows_sys::Win32::System::Ole::{OleInitialize, RegisterDragDrop};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetActiveWindow, MapVirtualKeyW, ReleaseCapture, SendInput, ToUnicode, INPUT,
-    INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
-    VIRTUAL_KEY, VK_LMENU, VK_MENU, VK_SPACE,
+    INPUT_0, INPUT_MOUSE, MAPVK_VK_TO_VSC, MOUSEEVENTF_MOVE, MOUSEINPUT, VIRTUAL_KEY, VK_SPACE,
 };
 use windows_sys::Win32::UI::Input::Touch::{RegisterTouchWindow, TWF_WANTPALM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -1578,42 +1577,131 @@ pub(crate) unsafe fn set_skip_taskbar(hwnd: HWND, skip: bool) {
     });
 }
 
+/// The input [`force_window_active`] sends before it brings a window to the front: a mouse move of
+/// zero distance, which moves nothing and is not a key anyone can bind.
+///
+/// It used to be an Alt press and release marked as an extended key. Keyboard hooks read that as
+/// Right Alt, so focusing a window toggled voice-chat apps' push-to-talk or mute key
+/// (storytold/pdfcraft#5801), and the app in front saw an Alt tap.
+fn foreground_unlock_input() -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
 unsafe fn force_window_active(handle: HWND) {
-    // In some situation, calling SetForegroundWindow could not bring up the window,
-    // This is a little hack which can "steal" the foreground window permission
-    // We only call this function in the window creation, so it should be fine.
-    // See : https://stackoverflow.com/questions/10740346/setforegroundwindow-only-working-while-visual-studio-is-open
-    let alt_sc = unsafe { MapVirtualKeyW(VK_MENU as u32, MAPVK_VK_TO_VSC) };
-
-    let inputs = [
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VK_LMENU,
-                    wScan: alt_sc as u16,
-                    dwFlags: KEYEVENTF_EXTENDEDKEY,
-                    dwExtraInfo: 0,
-                    time: 0,
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VK_LMENU,
-                    wScan: alt_sc as u16,
-                    dwFlags: KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
-                    dwExtraInfo: 0,
-                    time: 0,
-                },
-            },
-        },
-    ];
-
-    // Simulate a key press and release
-    unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), mem::size_of::<INPUT>() as i32) };
+    // While another app is in front, Windows refuses `SetForegroundWindow` unless this process
+    // sent the last input event, so send one first. See the remarks in
+    // https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setforegroundwindow
+    let input = foreground_unlock_input();
+    unsafe { SendInput(1, &input, mem::size_of::<INPUT>() as i32) };
 
     unsafe { SetForegroundWindow(handle) };
+}
+
+#[cfg(test)]
+mod force_window_active_tests {
+    use std::sync::atomic::AtomicU32;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::LRESULT;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, PeekMessageW, SetWindowsHookExW, TranslateMessage,
+        UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_REMOVE,
+        WH_KEYBOARD_LL,
+    };
+
+    use super::*;
+
+    #[test]
+    fn the_input_is_a_mouse_move_of_zero_distance() {
+        let input = foreground_unlock_input();
+        assert_eq!(input.r#type, INPUT_MOUSE);
+        // SAFETY: a mouse input holds `mi`.
+        let mi = unsafe { input.Anonymous.mi };
+        assert_eq!((mi.dx, mi.dy, mi.mouseData), (0, 0, 0));
+        // Relative: with `MOUSEEVENTF_ABSOLUTE`, (0, 0) would put the pointer in a screen corner.
+        assert_eq!(mi.dwFlags, MOUSEEVENTF_MOVE);
+    }
+
+    /// Injected key events the keyboard hook has seen.
+    static KEYS: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            let flags = unsafe { (*(lparam as *const KBDLLHOOKSTRUCT)).flags };
+            if flags & LLKHF_INJECTED != 0 {
+                KEYS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe { CallNextHookEx(0, code, wparam, lparam) }
+    }
+
+    /// Low-level hooks run while the thread that set them pumps messages.
+    fn pump(duration: Duration) {
+        let deadline = Instant::now() + duration;
+        let mut msg: MSG = unsafe { mem::zeroed() };
+        while Instant::now() < deadline {
+            while unsafe { PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) } != 0 {
+                unsafe { TranslateMessage(&msg) };
+                unsafe { DispatchMessageW(&msg) };
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn bringing_a_window_forward_presses_no_key() {
+        // Hotkey apps (Discord's push-to-talk and mute keys, for one) read keys with a low-level
+        // keyboard hook, so the test does too.
+        let module = unsafe { GetModuleHandleW(ptr::null()) };
+        let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
+        assert!(hook != 0, "keyboard hook: {}", io::Error::last_os_error());
+
+        // First check that the hook sees an injected key here: a session without an input desktop
+        // (a Windows service) gets none. The key is the release of 0xE8, a code Windows leaves
+        // unassigned, which no app acts on.
+        let release = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: 0xe8,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe { SendInput(1, &release, mem::size_of::<INPUT>() as i32) };
+        pump(Duration::from_millis(200));
+        let hook_works = KEYS.swap(0, Ordering::SeqCst) > 0;
+
+        // No window: `SetForegroundWindow` fails, and only the input sent before it matters.
+        if hook_works {
+            unsafe { force_window_active(0) };
+            pump(Duration::from_millis(300));
+        }
+        unsafe { UnhookWindowsHookEx(hook) };
+        if !hook_works {
+            eprintln!("skipped: a keyboard hook sees no injected keys in this session");
+            return;
+        }
+        assert_eq!(KEYS.load(Ordering::SeqCst), 0, "bringing a window forward pressed a key");
+    }
 }
