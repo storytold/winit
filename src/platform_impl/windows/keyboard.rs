@@ -61,7 +61,9 @@ pub struct MessageAsKeyEvent {
 ///   the key.
 ///
 /// Key release messages are a bit different due to the fact that they don't contribute to
-/// text input. The "sequence" only consists of one WM_KEYUP / WM_SYSKEYUP event.
+/// text input. The "sequence" only consists of one WM_KEYUP / WM_SYSKEYUP event. The exception
+/// is Alt's release ending an Alt code, which the code's WM_CHAR follows; that character is
+/// reported as a press and a release of its own (`PartialKeyEventInfo::alt_code`).
 pub struct KeyEventBuilder {
     event_info: Mutex<Option<PartialKeyEventInfo>>,
     pending: PendingEventQueue<MessageAsKeyEvent>,
@@ -260,7 +262,34 @@ impl KeyEventBuilder {
                             let key = layout.get_key(mod_no_ctrl, num_lock_on, vkey, physical_key);
                             event_info.text = PartialText::Text(key.to_text().map(SmolStr::new));
                         }
+                        let alt_code = event_info.alt_code;
                         let ev = event_info.finalize();
+                        if alt_code {
+                            // No key was pressed for the character, so none is left down: its
+                            // release follows the press. `pending_token` is earlier and still
+                            // incomplete, so completing the release dispatches nothing yet.
+                            let release = KeyEvent {
+                                state: ElementState::Released,
+                                text: None,
+                                platform_specific: KeyEventExtra {
+                                    text_with_all_modifiers: None,
+                                    key_without_modifiers: ev
+                                        .platform_specific
+                                        .key_without_modifiers
+                                        .clone(),
+                                },
+                                ..ev.clone()
+                            };
+                            let release_token = self.pending.add_pending();
+                            let early = self.pending.complete_pending(
+                                release_token,
+                                MessageAsKeyEvent { event: release, is_synthetic: false },
+                            );
+                            debug_assert!(
+                                early.is_empty(),
+                                "the release went out before its press"
+                            );
+                        }
                         MatchResult::MessagesToDispatch(self.pending.complete_pending(
                             pending_token,
                             MessageAsKeyEvent { event: ev, is_synthetic: false },
@@ -284,6 +313,16 @@ impl KeyEventBuilder {
                     // It's important that we create the pending token before reading the next
                     // message.
                     let next_msg = next_kbd_msg(hwnd);
+                    // An Alt code types its character when Alt is released: the `WM_CHAR`
+                    // follows Alt's key-up, and with no press for the `WM_CHAR` branch to add it
+                    // to, it was dropped as IME text. It goes on a press of its own instead
+                    // (storytold/pdfcraft#5746).
+                    let alt_released = matches!(event_info.vkey, VK_MENU | VK_LMENU | VK_RMENU);
+                    if alt_released
+                        && next_msg.is_some_and(|m| matches!(m.message, WM_CHAR | WM_SYSCHAR))
+                    {
+                        *self.event_info.lock().unwrap() = Some(PartialKeyEventInfo::alt_code());
+                    }
                     let mut valid_event_info = Some(event_info);
                     if let Some(next_msg) = next_msg {
                         let mut layouts = LAYOUT_CACHE.lock().unwrap();
@@ -457,6 +496,7 @@ impl KeyEventBuilder {
             location: get_location(scancode, locale_id),
             utf16parts: Vec::with_capacity(8),
             text: PartialText::Text(text.clone()),
+            alt_code: false,
         };
 
         let mut event = event_info.finalize();
@@ -498,9 +538,32 @@ struct PartialKeyEventInfo {
     utf16parts: Vec<u16>,
 
     text: PartialText,
+
+    /// The press an Alt code's character is reported on ([`Self::alt_code`]), which a release
+    /// follows at once.
+    alt_code: bool,
 }
 
 impl PartialKeyEventInfo {
+    /// The press that carries an Alt code's character. Holding Alt and typing a number on the
+    /// number pad (Alt+0181 for µ) makes Windows send the character in `WM_CHAR` after Alt is
+    /// released, with no key press of its own. It is reported like a character injected with
+    /// `VK_PACKET`: a press of an unidentified key, whose text and logical key are the character.
+    fn alt_code() -> Self {
+        PartialKeyEventInfo {
+            vkey: 0,
+            key_state: ElementState::Pressed,
+            is_repeat: false,
+            physical_key: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+            location: KeyLocation::Standard,
+            logical_key: PartialLogicalKey::TextOr(Key::Unidentified(NativeKey::Unidentified)),
+            key_without_modifiers: Key::Unidentified(NativeKey::Unidentified),
+            utf16parts: Vec::with_capacity(8),
+            text: PartialText::System(Vec::new()),
+            alt_code: true,
+        }
+    }
+
     fn from_message(
         wparam: WPARAM,
         lparam: LPARAM,
@@ -590,6 +653,7 @@ impl PartialKeyEventInfo {
             location,
             utf16parts: Vec::with_capacity(8),
             text: PartialText::System(Vec::new()),
+            alt_code: false,
         }
     }
 
@@ -1249,4 +1313,93 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0xe030 => KeyCode::AudioVolumeUp,
         _ => return PhysicalKey::Unidentified(NativeKeyCode::Windows(scancode as u16)),
     })
+}
+
+#[cfg(test)]
+mod alt_code_tests {
+    use std::{mem, ptr};
+
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_MENU, VK_RETURN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, PeekMessageW, PostMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+        WM_CHAR, WM_KEYUP,
+    };
+
+    use super::{KeyEventBuilder, MessageAsKeyEvent};
+    use crate::event::ElementState;
+    use crate::keyboard::{Key, NamedKey};
+    use crate::platform_impl::platform::event_loop::ProcResult;
+    use crate::platform_impl::platform::util;
+
+    /// The lParam of a key's release: repeat count 1, the key's scan code, previous state down,
+    /// transition up.
+    fn released(scancode: u32) -> LPARAM {
+        (1 | scancode << 16 | 1 << 30 | 1 << 31) as LPARAM
+    }
+
+    /// A key release, then the `WM_CHAR` Windows queues after it, through one builder: the events
+    /// for the release and for the character.
+    fn release_then_char(
+        vkey: u16,
+        scancode: u32,
+        ch: char,
+    ) -> (Vec<MessageAsKeyEvent>, Vec<MessageAsKeyEvent>) {
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let window: HWND = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                0,
+                util::get_instance_handle(),
+                ptr::null(),
+            )
+        };
+        assert_ne!(window, 0);
+        let lparam = released(scancode);
+        assert_ne!(unsafe { PostMessageW(window, WM_CHAR, ch as WPARAM, lparam) }, 0);
+        let builder = KeyEventBuilder::default();
+        let mut result = ProcResult::DefWindowProc(0);
+        let release =
+            builder.process_message(window, WM_KEYUP, vkey as WPARAM, lparam, &mut result);
+        let mut msg: MSG = unsafe { mem::zeroed() };
+        assert_ne!(unsafe { PeekMessageW(&mut msg, window, WM_CHAR, WM_CHAR, PM_REMOVE) }, 0);
+        let typed =
+            builder.process_message(window, msg.message, msg.wParam, msg.lParam, &mut result);
+        unsafe { DestroyWindow(window) };
+        (release, typed)
+    }
+
+    #[test]
+    fn an_alt_code_types_its_character() {
+        // Alt+0181: Windows sends µ after Alt's release (storytold/pdfcraft#5746).
+        let (release, typed) = release_then_char(VK_MENU, 0x38, 'µ');
+        let [alt] = release.as_slice() else {
+            panic!("{} events for Alt's release", release.len())
+        };
+        assert_eq!(alt.event.logical_key, Key::Named(NamedKey::Alt));
+        assert_eq!(alt.event.state, ElementState::Released);
+        let [press, up] = typed.as_slice() else { panic!("{} events for µ", typed.len()) };
+        assert_eq!(press.event.state, ElementState::Pressed);
+        assert_eq!(press.event.text.as_deref(), Some("µ"));
+        assert_eq!(press.event.logical_key, Key::Character("µ".into()));
+        assert_eq!(up.event.state, ElementState::Released);
+        assert_eq!(up.event.text, None);
+        assert_eq!(up.event.physical_key, press.event.physical_key);
+    }
+
+    #[test]
+    fn a_character_after_another_release_is_still_left_to_the_ime() {
+        // Only Alt's release ends an Alt code; a character queued after any other release is
+        // input method text, which reaches the app as `Ime` events.
+        let (_, typed) = release_then_char(VK_RETURN, 0x1c, 'x');
+        assert!(typed.is_empty(), "{} events for x", typed.len());
+    }
 }
