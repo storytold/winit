@@ -47,3 +47,8 @@ changelog entry.
 - On Wayland, add `ActiveEventLoopExtWayland::clipboard` and `platform::wayland::Clipboard`, which
   read and write text on the clipboard through winit's data device, so toolkits don't need to bind
   a second one.
+
+### Fixed
+
+- On Wayland, `Window::available_monitors` no longer lists an output twice once the compositor
+  reports it after startup.

@@ -387,7 +387,13 @@ impl OutputHandler for WinitState {
     }
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
-        self.monitors.lock().unwrap().push(MonitorHandle::new(output));
+        // Outputs bound at startup are already listed: `WinitState::new` seeds `monitors` from
+        // them, and SCTK reports each once more with its first complete `done`.
+        let monitor = MonitorHandle::new(output);
+        let mut monitors = self.monitors.lock().unwrap();
+        if !monitors.contains(&monitor) {
+            monitors.push(monitor);
+        }
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, updated: WlOutput) {
