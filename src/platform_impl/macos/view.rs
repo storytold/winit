@@ -8,7 +8,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
-    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSTextInputContext, NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying,
@@ -257,6 +257,20 @@ declare_class!(
             None
         }
 
+        // Craft patch: AppKit shows its text input UI, the Caps Lock badge included, for the first
+        // responder's input context. While IME is not allowed nothing is being typed, so the view
+        // answers none and no badge shows over the window's content (it showed in the middle of a
+        // drawing app's canvas). The view's own code reaches it through `text_input_context`.
+        #[method_id(inputContext)]
+        fn input_context(&self) -> Option<Retained<NSTextInputContext>> {
+            trace_scope!("inputContext");
+            if self.ivars().ime_allowed.get() {
+                self.text_input_context()
+            } else {
+                None
+            }
+        }
+
         #[method(resetCursorRects)]
         fn reset_cursor_rects(&self) {
             trace_scope!("resetCursorRects");
@@ -389,7 +403,7 @@ declare_class!(
             self.ivars().ime_startup.borrow_mut().other_callback();
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
-            if let Some(input_context) = self.inputContext() {
+            if let Some(input_context) = self.text_input_context() {
                 input_context.discardMarkedText();
             }
 
@@ -1074,8 +1088,14 @@ impl WinitView {
             && window.firstResponder().is_some_and(|responder| *responder == ***self)
     }
 
+    /// The view's input context, also while IME is not allowed (when `inputContext` answers none
+    /// to AppKit): ending a composition and reading the keyboard's input source need it then.
+    fn text_input_context(&self) -> Option<Retained<NSTextInputContext>> {
+        unsafe { msg_send_id![super(self), inputContext] }
+    }
+
     fn current_input_source(&self) -> String {
-        self.inputContext()
+        self.text_input_context()
             .and_then(|input_context| input_context.selectedKeyboardInputSource())
             .map(|input_source| input_source.to_string())
             .unwrap_or_default()
@@ -1164,7 +1184,7 @@ impl WinitView {
         // `unmarkText` from here; IME is still enabled then, so its `Preedit("")` comes before
         // `Disabled`.
         if self.ivars().marked_text.borrow().length() > 0 {
-            if let Some(input_context) = self.inputContext() {
+            if let Some(input_context) = self.text_input_context() {
                 input_context.discardMarkedText();
             }
         }
@@ -1186,7 +1206,7 @@ impl WinitView {
         if self.ivars().marked_text.borrow().length() == 0 {
             return;
         }
-        if let Some(input_context) = self.inputContext() {
+        if let Some(input_context) = self.text_input_context() {
             input_context.discardMarkedText();
         }
         // The input method may have ended the preedit through `unmarkText` already.
@@ -1247,7 +1267,7 @@ impl WinitView {
     pub(super) fn set_ime_cursor_area(&self, position: NSPoint, size: NSSize) {
         self.ivars().ime_position.set(position);
         self.ivars().ime_size.set(size);
-        if let Some(input_context) = self.inputContext() {
+        if let Some(input_context) = self.text_input_context() {
             input_context.invalidateCharacterCoordinates();
         }
     }

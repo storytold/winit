@@ -859,3 +859,27 @@ fn windows_keys_taken_by_the_ime_are_not_sent() {
         "a key the IME took is sent as a key press"
     );
 }
+
+#[test]
+fn macos_view_has_no_input_context_while_ime_is_not_allowed() {
+    // AppKit shows its text input UI, the Caps Lock indicator included, for the first responder's
+    // input context. winit 0.30.13's view always has one, so on recent macOS turning Caps
+    // Lock on showed the indicator over the window's content (in the middle of a drawing app's
+    // canvas) with nothing being typed. The view answers `inputContext` with none while IME is not
+    // allowed; its own code keeps the context through `text_input_context`.
+    let view = source("macos/view.rs");
+    let input_context = view_method(&view, "fn input_context(&self)");
+    assert!(
+        input_context.contains("if self.ivars().ime_allowed.get() {")
+            && input_context.contains("self.text_input_context()"),
+        "the view has an input context while IME is not allowed"
+    );
+    assert!(
+        view.contains("msg_send_id![super(self), inputContext]"),
+        "text_input_context doesn't ask NSView for the context"
+    );
+    assert!(
+        !view.contains("self.inputContext()"),
+        "the view's own code asks for the context it hides from AppKit"
+    );
+}
