@@ -222,3 +222,13 @@ cross-compilation checks for Windows x86_64 GNU and macOS AArch64. Cross-compila
 execute native tests. The main-thread AppKit harness, Windows native message/IMM tests, live
 XIM/Wayland input methods, matching egui adapter and downstream custom editors remain separate
 qualification gates. Human review and merge are required.
+
+
+## Wayland file drag coordinates (`WindowEvent::HoveredFileMoved`)
+
+Forwards surface-local drag coordinates from `wl_data_device::enter` and `wl_data_device::motion`
+in `src/platform_impl/linux/wayland/seat/dnd.rs` as `WindowEvent::HoveredFileMoved(PhysicalPosition<f64>)`
+scaled by the target window's scale factor (`storytold/photocraft#10225`). Cancelling an active
+file drag or completing a `text/uri-list` drop with no local `file://` URIs emits
+`WindowEvent::HoveredFileCancelled` so downstream integrations do not leak drag coordinates into
+later drags.

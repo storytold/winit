@@ -56,10 +56,18 @@ impl WinitState {
         if let Some(reader) = drag.reader {
             self.loop_handle.remove(reader);
         }
-        if drag.hovered {
-            self.events_sink.push_window_event(WindowEvent::HoveredFileCancelled, drag.window_id);
-        }
+        self.events_sink.push_window_event(WindowEvent::HoveredFileCancelled, drag.window_id);
         self.dispatched_events = true;
+    }
+
+    /// Converts surface-local logical drag coordinates to physical pixels and reports them.
+    fn push_file_drag_moved(&mut self, window_id: WindowId, x: f64, y: f64) {
+        if let Some(window) = self.windows.get_mut().get(&window_id) {
+            let scale_factor = window.lock().unwrap().scale_factor();
+            let position = drag_surface_to_physical(x, y, scale_factor);
+            self.events_sink.push_window_event(WindowEvent::HoveredFileMoved(position), window_id);
+            self.dispatched_events = true;
+        }
     }
 
     /// Reports what is known about a seat's file drag: hovered files once they are read, and
@@ -95,8 +103,13 @@ impl WinitState {
         }
         drag.offer.destroy();
 
-        for path in drag.paths.unwrap_or_default() {
-            self.events_sink.push_window_event(WindowEvent::DroppedFile(path), drag.window_id);
+        let paths = drag.paths.unwrap_or_default();
+        if paths.is_empty() {
+            self.events_sink.push_window_event(WindowEvent::HoveredFileCancelled, drag.window_id);
+        } else {
+            for path in paths {
+                self.events_sink.push_window_event(WindowEvent::DroppedFile(path), drag.window_id);
+            }
         }
         self.dispatched_events = true;
     }
@@ -143,8 +156,8 @@ impl DataDeviceHandler for WinitState {
         conn: &Connection,
         _: &QueueHandle<Self>,
         data_device: &WlDataDevice,
-        _: f64,
-        _: f64,
+        x: f64,
+        y: f64,
         surface: &WlSurface,
     ) {
         let data = data_device.data::<DataDeviceData>().unwrap();
@@ -197,6 +210,7 @@ impl DataDeviceHandler for WinitState {
             hovered: false,
             dropped: false,
         });
+        self.push_file_drag_moved(window_id, x, y);
     }
 
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, data_device: &WlDataDevice) {
@@ -217,15 +231,20 @@ impl DataDeviceHandler for WinitState {
         conn: &Connection,
         _: &QueueHandle<Self>,
         data_device: &WlDataDevice,
-        _: f64,
-        _: f64,
+        x: f64,
+        y: f64,
     ) {
         let seat = data_device.data::<DataDeviceData>().unwrap().seat().id();
         // Some compositors want the type accepted again as the drag moves. The actions are not
         // set again: that restarts the negotiation and can turn a quick drop into a leave.
-        if let Some(drag) = self.seats.get(&seat).and_then(|seat| seat.file_drag.as_ref()) {
-            drag.offer.accept_mime_type(drag.offer.serial, Some(URI_LIST.to_owned()));
-            let _ = conn.flush();
+        let window_id =
+            self.seats.get(&seat).and_then(|seat| seat.file_drag.as_ref()).and_then(|drag| {
+                drag.offer.accept_mime_type(drag.offer.serial, Some(URI_LIST.to_owned()));
+                let _ = conn.flush();
+                (!drag.dropped).then_some(drag.window_id)
+            });
+        if let Some(window_id) = window_id {
+            self.push_file_drag_moved(window_id, x, y);
         }
     }
 
@@ -321,6 +340,15 @@ impl DataSourceHandler for WinitState {
 
 sctk::delegate_data_device!(WinitState);
 
+/// Converts surface-local Wayland drag coordinates to physical client-area pixels.
+fn drag_surface_to_physical(
+    x: f64,
+    y: f64,
+    scale_factor: f64,
+) -> crate::dpi::PhysicalPosition<f64> {
+    crate::dpi::LogicalPosition::new(x, y).to_physical(scale_factor)
+}
+
 /// The local files in a `text/uri-list` (RFC 2483): one URI per line, `#` starting a comment.
 /// Only `file` URIs naming this machine (no host, or `localhost`) become paths.
 fn parse_uri_list(list: &[u8]) -> Vec<PathBuf> {
@@ -385,10 +413,10 @@ mod tests {
 
     #[test]
     fn reads_file_uris() {
-        assert_eq!(paths("file:///home/me/a.txt\r\nfile:///tmp/b%20c.png\r\n"), [
-            PathBuf::from("/home/me/a.txt"),
-            PathBuf::from("/tmp/b c.png")
-        ]);
+        assert_eq!(
+            paths("file:///home/me/a.txt\r\nfile:///tmp/b%20c.png\r\n"),
+            [PathBuf::from("/home/me/a.txt"), PathBuf::from("/tmp/b c.png")]
+        );
     }
 
     #[test]
@@ -406,10 +434,10 @@ mod tests {
 
     #[test]
     fn accepts_localhost_and_skips_other_hosts() {
-        assert_eq!(paths("file://localhost/a\r\nfile://LOCALHOST/b\r\nfile://elsewhere/c\r\n"), [
-            PathBuf::from("/a"),
-            PathBuf::from("/b")
-        ]);
+        assert_eq!(
+            paths("file://localhost/a\r\nfile://LOCALHOST/b\r\nfile://elsewhere/c\r\n"),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]
@@ -427,5 +455,17 @@ mod tests {
     fn accepts_the_short_file_form_and_drops_fragments() {
         assert_eq!(paths("file:/a/b#frag"), [PathBuf::from("/a/b")]);
         assert_eq!(paths("FILE:///%23literal"), [PathBuf::from("/#literal")]);
+    }
+
+    #[test]
+    fn converts_drag_surface_coordinates_with_window_scaling() {
+        assert_eq!(
+            drag_surface_to_physical(120.5, 45.25, 1.0),
+            crate::dpi::PhysicalPosition::new(120.5, 45.25)
+        );
+        assert_eq!(
+            drag_surface_to_physical(120.5, 45.25, 2.0),
+            crate::dpi::PhysicalPosition::new(241.0, 90.5)
+        );
     }
 }
