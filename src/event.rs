@@ -185,6 +185,9 @@ pub enum WindowEvent {
     /// separately.
     HoveredFile(PathBuf),
 
+    /// A file drag has entered or moved over the window at the given physical client-area position.
+    HoveredFileMoved(PhysicalPosition<f64>),
+
     /// A file was hovered, but has exited the window.
     ///
     /// There will be a single `HoveredFileCancelled` event triggered even if multiple files were
@@ -1053,6 +1056,7 @@ mod tests {
                 with_window_event(Resized((0, 0).into()));
                 with_window_event(DroppedFile("x.txt".into()));
                 with_window_event(HoveredFile("x.txt".into()));
+                with_window_event(HoveredFileMoved((0, 0).into()));
                 with_window_event(HoveredFileCancelled);
                 with_window_event(Ime(Enabled));
                 with_window_event(CursorMoved { device_id: did, position: (0, 0).into() });
