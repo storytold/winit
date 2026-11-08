@@ -24,9 +24,10 @@ use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
-use crate::event::WindowEvent;
+use crate::dpi::LogicalPosition;
+use crate::event::{DeviceId as RootDeviceId, WindowEvent};
 use crate::platform_impl::wayland::state::WinitState;
-use crate::platform_impl::wayland::{make_wid, WindowId};
+use crate::platform_impl::wayland::{make_wid, DeviceId, WindowId};
 
 const URI_LIST: &str = "text/uri-list";
 
@@ -59,6 +60,24 @@ impl WinitState {
         if drag.hovered {
             self.events_sink.push_window_event(WindowEvent::HoveredFileCancelled, drag.window_id);
         }
+        // The drag put the pointer over the window (`file_drag_moved`); it left without a drop.
+        let device_id = RootDeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
+        self.events_sink.push_window_event(WindowEvent::CursorLeft { device_id }, drag.window_id);
+        self.dispatched_events = true;
+    }
+
+    /// Reports where a file drag is over its window as pointer motion: during a drag the compositor
+    /// sends the pointer no events, so the app would otherwise see no position for the files.
+    fn file_drag_moved(&mut self, window_id: WindowId, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        let Some(window) = self.windows.get_mut().get(&window_id) else { return };
+        let scale_factor = window.lock().unwrap().scale_factor();
+        let position = LogicalPosition::new(x, y).to_physical(scale_factor);
+        let device_id = RootDeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
+        self.events_sink
+            .push_window_event(WindowEvent::CursorMoved { device_id, position }, window_id);
         self.dispatched_events = true;
     }
 
@@ -143,8 +162,8 @@ impl DataDeviceHandler for WinitState {
         conn: &Connection,
         _: &QueueHandle<Self>,
         data_device: &WlDataDevice,
-        _: f64,
-        _: f64,
+        x: f64,
+        y: f64,
         surface: &WlSurface,
     ) {
         let data = data_device.data::<DataDeviceData>().unwrap();
@@ -197,6 +216,7 @@ impl DataDeviceHandler for WinitState {
             hovered: false,
             dropped: false,
         });
+        self.file_drag_moved(window_id, x, y);
     }
 
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, data_device: &WlDataDevice) {
@@ -217,15 +237,21 @@ impl DataDeviceHandler for WinitState {
         conn: &Connection,
         _: &QueueHandle<Self>,
         data_device: &WlDataDevice,
-        _: f64,
-        _: f64,
+        x: f64,
+        y: f64,
     ) {
         let seat = data_device.data::<DataDeviceData>().unwrap().seat().id();
         // Some compositors want the type accepted again as the drag moves. The actions are not
         // set again: that restarts the negotiation and can turn a quick drop into a leave.
-        if let Some(drag) = self.seats.get(&seat).and_then(|seat| seat.file_drag.as_ref()) {
-            drag.offer.accept_mime_type(drag.offer.serial, Some(URI_LIST.to_owned()));
-            let _ = conn.flush();
+        let Some(drag) = self.seats.get(&seat).and_then(|seat| seat.file_drag.as_ref()) else {
+            return;
+        };
+        drag.offer.accept_mime_type(drag.offer.serial, Some(URI_LIST.to_owned()));
+        let _ = conn.flush();
+        // After the drop the last position is where the files landed, and stays the pointer's.
+        if !drag.dropped {
+            let window_id = drag.window_id;
+            self.file_drag_moved(window_id, x, y);
         }
     }
 

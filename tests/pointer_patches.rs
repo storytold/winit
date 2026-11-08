@@ -61,3 +61,31 @@ fn wayland_pixel_wheels_report_moved() {
         "axis events don't take their phase from the scroll source"
     );
 }
+
+#[test]
+fn wayland_file_drags_move_the_pointer() {
+    // During a drag the compositor sends the pointer no events, so the data device's `enter` and
+    // `motion` report the position as pointer motion. After the drop the last position stays; a
+    // cancelled drag sends `CursorLeft` (W39, storytold/photocraft#8794).
+    let dnd = source("linux/wayland/seat/dnd.rs");
+    let moved = section(&dnd, "fn file_drag_moved(", "\n    }\n");
+    assert!(
+        moved.contains("WindowEvent::CursorMoved") && moved.contains(".to_physical(scale_factor)"),
+        "a drag position isn't reported as physical pointer motion"
+    );
+    let enter = section(&dnd, "fn enter(", "\n    fn leave(");
+    assert!(
+        enter.contains("self.file_drag_moved(window_id, x, y)"),
+        "the drag entering doesn't report a position"
+    );
+    let motion = section(&dnd, "    fn motion(", "\n    fn selection(");
+    assert!(
+        motion.contains("if !drag.dropped") && motion.contains("self.file_drag_moved("),
+        "drag motion isn't reported, or moves the position after the drop"
+    );
+    let cancel = section(&dnd, "pub(super) fn cancel_file_drag(", "\n    }\n");
+    assert!(
+        cancel.contains("WindowEvent::CursorLeft"),
+        "a cancelled drag leaves the pointer over the window"
+    );
+}
