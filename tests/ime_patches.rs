@@ -808,6 +808,32 @@ fn macos_first_apple_korean_key_is_retried_once() {
     );
 }
 
+#[test]
+fn macos_korean_key_text_survives_a_replacement() {
+    // Apple Korean doesn't use marked text: every key calls `insertText:replacementRange:`,
+    // replacing the syllable typed so far. The key's own text is left to its `KeyboardInput`,
+    // which keyDown drops when the same key also committed or enabled IME. That text never
+    // reached the app, yet the next replacement deleted it there, eating a real character
+    // (spaces vanished, the previous syllable was overwritten). Text the app hasn't received is
+    // remembered, kept out of replacements and committed when keyDown drops the key.
+    let view = source("macos/view.rs");
+    let insert_text = view_method(&view, "fn insert_text(");
+    assert!(
+        insert_text.contains("self.ivars().deferred_key_text.borrow_mut().push_str(&string);"),
+        "insertText doesn't remember the key's text"
+    );
+    let key_down = view_method(&view, "fn key_down(");
+    assert!(
+        key_down.contains("self.queue_commit(deferred, None);"),
+        "keyDown doesn't commit the key's text it drops"
+    );
+    let replaced = section(&view, "fn replaced(", "\n    }\n");
+    assert!(
+        replaced.contains("delete.before_bytes -= gone;"),
+        "a replacement deletes text the app hasn't received"
+    );
+}
+
 // `SystemCaret` is plain Rust, so its policy tests run on every platform.
 #[allow(dead_code)]
 #[path = "../src/platform_impl/windows/ime_caret.rs"]

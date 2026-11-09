@@ -146,6 +146,10 @@ pub struct ViewState {
     /// True if the key being handled by `keyDown:` committed IME text.
     committed_in_key_down: Cell<bool>,
 
+    /// Text an input method inserted for the key being handled that is left to the key's
+    /// `KeyboardInput` and hasn't reached the app yet.
+    deferred_key_text: RefCell<String>,
+
     /// True if `interpretKeyEvents` called back for the key `keyDown:` is handling.
     key_interpreted: Cell<bool>,
 
@@ -528,7 +532,10 @@ declare_class!(
                             self.notify_ime_enabled();
                             self.queue_commit(String::new(), delete);
                         }
-                        self.ivars().ime_document.borrow_mut().insert(&string)
+                        self.ivars().ime_document.borrow_mut().insert(&string);
+                        if self.ivars().in_key_down.get() {
+                            self.ivars().deferred_key_text.borrow_mut().push_str(&string);
+                        }
                     },
                     PlainInsert::Commit if self.ivars().ime_allowed.get() => {
                         let delete = self.replaced(replacement_range);
@@ -590,6 +597,7 @@ declare_class!(
             // Get the characters from the event.
             let old_ime_state = self.ivars().ime_state.get();
             self.ivars().forward_key_to_app.set(false);
+            self.ivars().deferred_key_text.borrow_mut().clear();
             let event = replace_event(event, self.option_as_alt());
 
             // WordCraft patch: on the first key in a fresh app, Apple Korean can call `insertText`
@@ -676,6 +684,7 @@ declare_class!(
                 && !self.ivars().key_interpreted.get()
                 && !modifiers.intersects(ModifiersState::SUPER | ModifiersState::CONTROL);
 
+            let deferred = std::mem::take(&mut *self.ivars().deferred_key_text.borrow_mut());
             if (!had_ime_input || self.ivars().forward_key_to_app.get()) && !held_for_accents {
                 let key_event = create_key_event(&event, true, unsafe { event.isARepeat() });
                 self.queue_event(WindowEvent::KeyboardInput {
@@ -683,6 +692,13 @@ declare_class!(
                     event: key_event,
                     is_synthetic: false,
                 });
+            } else if !deferred.is_empty() {
+                // The key's text was left to its `KeyboardInput`, which isn't sent because the same
+                // key press also committed (Apple Korean ends a syllable with `insertText` of it,
+                // then inserts the Space or the next jamo) or enabled IME. Without this the text is
+                // lost while `ime_document` and the input method count it, and the next
+                // replacement deletes a character the app does have.
+                self.queue_commit(deferred, None);
             }
         }
 
@@ -1011,6 +1027,7 @@ impl WinitView {
             forward_key_to_app: Default::default(),
             in_key_down: Default::default(),
             committed_in_key_down: Default::default(),
+            deferred_key_text: Default::default(),
             key_interpreted: Default::default(),
             key_characters: Default::default(),
             ime_document: Default::default(),
@@ -1094,7 +1111,19 @@ impl WinitView {
     fn replaced(&self, range: NSRange) -> Option<ImeDeleteSurrounding> {
         let range =
             (range.location != NSNotFound as NSUInteger).then_some((range.location, range.length));
-        self.ivars().ime_document.borrow_mut().replace(range)
+        let mut delete = self.ivars().ime_document.borrow_mut().replace(range)?;
+        // Apple Korean replaces the jamo it inserted for this very key (the first key after IME
+        // is enabled) or the key's own text: that text sits at the end, before the caret, and
+        // hasn't reached the app, so only the rest is deleted there.
+        let mut deferred = self.ivars().deferred_key_text.borrow_mut();
+        let mut keep = deferred.len() - delete.before_bytes.min(deferred.len());
+        while !deferred.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let gone = deferred.len() - keep;
+        deferred.truncate(keep);
+        delete.before_bytes -= gone;
+        (delete.before_bytes > 0 || delete.after_bytes > 0).then_some(delete)
     }
 
     /// Queue `Ime::Commit(text)`. While the app handles it, `take_ime_delete_surrounding` returns
