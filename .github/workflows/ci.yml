@@ -183,7 +183,8 @@ jobs:
       with:
         tool: wasm-bindgen-cli
 
-    - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+    # Upstream, not step-security/dtolnay-rust-toolchain: installing a non-native host toolchain (i686 on x64) needs --force-non-host, which that fork lacks.
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
         toolchain: ${{ matrix.toolchain }}${{ matrix.platform.host }}
         targets: ${{ matrix.platform.target }}
