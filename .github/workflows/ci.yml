@@ -183,12 +183,27 @@ jobs:
       with:
         tool: wasm-bindgen-cli
 
-    # Upstream, not step-security/dtolnay-rust-toolchain: installing a non-native host toolchain (i686 on x64) needs --force-non-host, which that fork lacks.
-    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+    - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+      if: matrix.platform.host == ''
       with:
-        toolchain: ${{ matrix.toolchain }}${{ matrix.platform.host }}
+        toolchain: ${{ matrix.toolchain }}
         targets: ${{ matrix.platform.target }}
         components: clippy, ${{ matrix.platform.components }}
+    # A toolchain for another host (i686 GNU on the x64 runner) needs --force-non-host, which
+    # step-security/dtolnay-rust-toolchain does not pass, so rustup installs it directly.
+    - name: Install the ${{ matrix.platform.host }} host toolchain
+      if: matrix.platform.host != ''
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ matrix.toolchain }}${{ matrix.platform.host }}
+        TARGET: ${{ matrix.platform.target }}
+        COMPONENTS: clippy, ${{ matrix.platform.components }}
+      run: |
+        set -euo pipefail
+        flags=(--target "$TARGET")
+        for component in ${COMPONENTS//,/ }; do flags+=(--component "$component"); done
+        rustup toolchain install "$TOOLCHAIN" "${flags[@]}" --profile minimal --no-self-update --force-non-host
+        rustup default "$TOOLCHAIN" --force-non-host
 
     - name: Check documentation
       run: cargo doc --no-deps $OPTIONS --document-private-items
