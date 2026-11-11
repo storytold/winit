@@ -10,6 +10,10 @@ jobs:
     name: Check formatting
     runs-on: ubuntu-latest
     steps:
+    - name: Harden runner
+      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      with:
+        egress-policy: audit
     - uses: taiki-e/checkout-action@v1
     - uses: dtolnay/rust-toolchain@nightly
       with:
@@ -21,6 +25,10 @@ jobs:
     name: Taplo
     runs-on: ubuntu-latest
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
       - name: Checkout
         uses: taiki-e/checkout-action@v1
       - name: Install Taplo
@@ -35,6 +43,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
       - uses: taiki-e/checkout-action@v1
       - uses: taiki-e/install-action@v2
         with:
@@ -118,6 +130,10 @@ jobs:
       CMD: ${{ matrix.platform.cmd }}
 
     steps:
+    - name: Harden runner
+      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      with:
+        egress-policy: audit
     - uses: taiki-e/checkout-action@v1
 
     - name: Restore cache of cargo folder
@@ -295,6 +311,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - name: Harden runner
+      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      with:
+        egress-policy: audit
     - uses: taiki-e/checkout-action@v1
     - uses: EmbarkStudios/cargo-deny-action@v2
       with:
@@ -309,6 +329,10 @@ jobs:
         working-directory: ./winit-web/src/script
 
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
       - uses: taiki-e/checkout-action@v1
       - name: Setup NPM
         run: npm install
@@ -324,6 +348,10 @@ jobs:
         working-directory: ./winit-web/src/script
 
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
       - uses: taiki-e/checkout-action@v1
       - name: Install SWC
         run: sudo npm i -g @swc/cli
