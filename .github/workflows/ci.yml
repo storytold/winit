@@ -11,11 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Harden runner
-      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      uses: step-security/harden-runner@v2.22.4
       with:
         egress-policy: audit
-    - uses: taiki-e/checkout-action@v1
-    - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+    - uses: taiki-e/checkout-action@v1.4.2
+    - uses: step-security/dtolnay-rust-toolchain@v1.0.0
       with:
         toolchain: nightly
         components: rustfmt
@@ -27,13 +27,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@v2.22.4
         with:
           egress-policy: audit
       - name: Checkout
-        uses: taiki-e/checkout-action@v1
+        uses: taiki-e/checkout-action@v1.4.2
       - name: Install Taplo
-        uses: step-security/taiki-e-install-action@76747d22a7567cc4438546a84f11bdf18e670ab8 # v2.87.32
+        uses: step-security/taiki-e-install-action@v2.87.32
         with:
           tool: taplo-cli
       - name: Run Taplo
@@ -45,11 +45,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@v2.22.4
         with:
           egress-policy: audit
-      - uses: taiki-e/checkout-action@v1
-      - uses: step-security/taiki-e-install-action@76747d22a7567cc4438546a84f11bdf18e670ab8 # v2.87.32
+      - uses: taiki-e/checkout-action@v1.4.2
+      - uses: step-security/taiki-e-install-action@v2.87.32
         with:
           tool: typos-cli
       - name: run typos
@@ -132,17 +132,17 @@ jobs:
 
     steps:
     - name: Harden runner
-      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      uses: step-security/harden-runner@v2.22.4
       with:
         egress-policy: audit
-    - uses: taiki-e/checkout-action@v1
+    - uses: taiki-e/checkout-action@v1.4.2
 
     - name: Restore cache of cargo folder
       # We use `restore` and later `save`, so that we can create the key after
       # the cache has been downloaded.
       #
       # This could be avoided if we added Cargo.lock to the repository.
-      uses: actions/cache/restore@v5
+      uses: actions/cache/restore@v5.1.0
       with:
         # https://doc.rust-lang.org/cargo/guide/cargo-home.html#caching-the-cargo-home-in-ci
         path: |
@@ -163,13 +163,13 @@ jobs:
     - name: Cache cargo-apk
       if: contains(matrix.platform.target, 'android')
       id: cargo-apk-cache
-      uses: actions/cache@v5
+      uses: actions/cache@v5.1.0
       with:
         path: ~/.cargo/bin/cargo-apk
         # Change this key if we update the required cargo-apk version
         key: cargo-apk-v0-9-7
 
-    - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+    - uses: step-security/dtolnay-rust-toolchain@v1.0.0
       if: contains(matrix.platform.target, 'android') && (steps.cargo-apk-cache.outputs.cache-hit != 'true')
       with:
         toolchain: stable
@@ -178,12 +178,12 @@ jobs:
       if: contains(matrix.platform.target, 'android') && (steps.cargo-apk-cache.outputs.cache-hit != 'true')
       run: cargo install cargo-apk --version=^0.9.7 --locked
 
-    - uses: step-security/cache-cargo-install-action@8710a7398ec4810e2dc6ab750c864efc91818376 # v3.0.8
+    - uses: step-security/cache-cargo-install-action@v3.0.8
       if: contains(matrix.platform.target, 'wasm32') && matrix.toolchain == 'nightly'
       with:
         tool: wasm-bindgen-cli
 
-    - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+    - uses: step-security/dtolnay-rust-toolchain@v1.0.0
       if: matrix.platform.host == ''
       with:
         toolchain: ${{ matrix.toolchain }}
@@ -315,7 +315,7 @@ jobs:
 
     # See restore step above
     - name: Save cache of cargo folder
-      uses: actions/cache/save@v5
+      uses: actions/cache/save@v5.1.0
       with:
         path: |
           ~/.cargo/registry/index/
@@ -329,11 +329,11 @@ jobs:
 
     steps:
     - name: Harden runner
-      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      uses: step-security/harden-runner@v2.22.4
       with:
         egress-policy: audit
-    - uses: taiki-e/checkout-action@v1
-    - uses: EmbarkStudios/cargo-deny-action@v2
+    - uses: taiki-e/checkout-action@v1.4.2
+    - uses: EmbarkStudios/cargo-deny-action@v2.1.1
       with:
         log-level: error
 
@@ -347,10 +347,10 @@ jobs:
 
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@v2.22.4
         with:
           egress-policy: audit
-      - uses: taiki-e/checkout-action@v1
+      - uses: taiki-e/checkout-action@v1.4.2
       - name: Setup NPM
         run: npm install
       - name: Run ESLint
@@ -366,10 +366,10 @@ jobs:
 
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@v2.22.4
         with:
           egress-policy: audit
-      - uses: taiki-e/checkout-action@v1
+      - uses: taiki-e/checkout-action@v1.4.2
       - name: Install SWC
         run: sudo npm i -g @swc/cli
       - name: Run SWC
