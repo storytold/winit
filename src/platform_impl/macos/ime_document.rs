@@ -15,7 +15,7 @@ use super::ImeDeleteSurrounding;
 /// Text kept for replacements, in characters.
 const KEPT_CHARS: usize = 256;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct ImeDocument {
     /// The text inserted since the last reset; the caret is at its end.
     typed: String,
@@ -128,6 +128,29 @@ pub(super) fn plain_insert(text: &str, key_characters: Option<&str>) -> PlainIns
         // The emoji picker or dictation, outside any key press.
         None => PlainInsert::Commit,
     }
+}
+
+/// Returns `true` when `PlainInsert::KeyText` must emit `Ime::Commit` because `keyDown:`
+/// will suppress `WindowEvent::KeyboardInput` for the current key event.
+///
+/// For example, Apple Korean 2-Set commits a finished batchim syllable (`insertText("한", {0, 1})`,
+/// setting `committed_in_key_down = true`) and then sends a second `insertText("ㄱ", NSNotFound)`
+/// in the same `keyDown:`. Without committing that second string here, `keyDown:` suppresses
+/// `KeyboardInput` while `ImeDocument` still records `"ㄱ"`, shifting subsequent replacements.
+pub(super) fn key_text_must_commit(
+    ime_allowed: bool,
+    in_key_down: bool,
+    committed_in_key_down: bool,
+    ime_state_changed: bool,
+    in_preedit_or_committed: bool,
+    delete_triggers_enable: bool,
+) -> bool {
+    ime_allowed
+        && in_key_down
+        && (committed_in_key_down
+            || ime_state_changed
+            || in_preedit_or_committed
+            || delete_triggers_enable)
 }
 
 #[cfg(test)]

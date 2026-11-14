@@ -50,6 +50,19 @@ impl ImeStartup {
         self.batch = None;
     }
 
+    pub fn is_armed(&self) -> bool {
+        self.batch.is_some()
+    }
+
+    /// In macOS 15 inline Korean composition, `KIM_Extension` queries `selectedRange` right after
+    /// inserting the initial jamo via `insertText`; cold AppKit fallbacks do not.
+    pub fn selection_queried_after_insert(&mut self) {
+        if self.batch.as_ref().is_some_and(|batch| batch.inserted) {
+            self.batch = None;
+            self.attempted = true;
+        }
+    }
+
     pub fn finish(&mut self, serial: u64, same_context: bool) -> bool {
         // A nested keyDown or IME reset invalidates the outer interpretation.
         if serial != self.serial {

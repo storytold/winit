@@ -22,7 +22,7 @@ use super::event::{
     code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
     scancode_to_physicalkey, KeyEventExtra,
 };
-use super::ime_document::{plain_insert, ImeDocument, PlainInsert};
+use super::ime_document::{key_text_must_commit, plain_insert, ImeDocument, PlainInsert};
 use super::ime_startup::ImeStartup;
 use super::window::WinitWindow;
 use super::DEVICE_ID;
@@ -142,6 +142,9 @@ pub struct ViewState {
 
     /// True while `keyDown:` runs `interpretKeyEvents`.
     in_key_down: Cell<bool>,
+
+    /// `ime_state` at entry to the innermost `keyDown:`.
+    key_down_old_ime_state: Cell<ImeState>,
 
     /// True if the key being handled by `keyDown:` committed IME text.
     committed_in_key_down: Cell<bool>,
@@ -293,6 +296,9 @@ declare_class!(
         #[method(selectedRange)]
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
+            if self.ivars().in_key_down.get() {
+                self.ivars().ime_startup.borrow_mut().selection_queried_after_insert();
+            }
             // Dictation inserts nothing without a caret, and press-and-hold needs one to replace
             // the letter it accents. Reporting one also replaces key repeat in text input with the
             // accent menu, as in other Mac apps.
@@ -420,6 +426,9 @@ declare_class!(
             actual_range: *mut NSRange,
         ) -> Option<Retained<NSAttributedString>> {
             trace_scope!("attributedSubstringForProposedRange:actualRange:");
+            if self.ivars().in_key_down.get() {
+                self.ivars().ime_startup.borrow_mut().other_callback();
+            }
             let substring =
                 self.ivars().ime_document.borrow().substring((range.location, range.length));
             substring.map(|(text, (location, length))| {
@@ -522,13 +531,29 @@ declare_class!(
                 match plain_insert(&string, key_characters.as_deref()) {
                     PlainInsert::KeyText => {
                         let delete = self.replaced(replacement_range);
-                        // The deletion goes before the key's `KeyboardInput`, which `keyDown:`
-                        // sends after this returns.
-                        if delete.is_some() && self.ivars().ime_allowed.get() {
+                        let ime_state = self.ivars().ime_state.get();
+                        let commit_key_text = key_text_must_commit(
+                            self.ivars().ime_allowed.get(),
+                            self.ivars().in_key_down.get(),
+                            self.ivars().committed_in_key_down.get(),
+                            ime_state != self.ivars().key_down_old_ime_state.get(),
+                            matches!(ime_state, ImeState::Committed | ImeState::Preedit),
+                            delete.is_some() && ime_state == ImeState::Disabled,
+                        );
+                        if commit_key_text {
                             self.notify_ime_enabled();
-                            self.queue_commit(String::new(), delete);
+                            self.ivars().committed_in_key_down.set(true);
+                            self.ivars().ime_document.borrow_mut().insert(&string);
+                            self.queue_commit(string, delete);
+                        } else {
+                            // The deletion goes before the key's `KeyboardInput`, which `keyDown:`
+                            // sends after this returns.
+                            if delete.is_some() && self.ivars().ime_allowed.get() {
+                                self.notify_ime_enabled();
+                                self.queue_commit(String::new(), delete);
+                            }
+                            self.ivars().ime_document.borrow_mut().insert(&string);
                         }
-                        self.ivars().ime_document.borrow_mut().insert(&string)
                     },
                     PlainInsert::Commit if self.ivars().ime_allowed.get() => {
                         let delete = self.replaced(replacement_range);
@@ -625,9 +650,16 @@ declare_class!(
 
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
-                self.ivars().in_key_down.set(true);
+                let outer_in_key_down = self.ivars().in_key_down.replace(true);
+                let outer_old_ime_state = self.ivars().key_down_old_ime_state.replace(old_ime_state);
                 self.ivars().key_interpreted.set(false);
                 let outer_key = self.ivars().key_characters.replace(Some(characters));
+                let pre_attempt_document = self
+                    .ivars()
+                    .ime_startup
+                    .borrow()
+                    .is_armed()
+                    .then(|| self.ivars().ime_document.borrow().clone());
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
 
                 let same_context = self.ivars().ime_allowed.get()
@@ -638,10 +670,14 @@ declare_class!(
                     && self.ime_retry_has_focus();
                 let retry = self.ivars().ime_startup.borrow_mut().finish(serial, same_context);
                 if retry {
+                    if let Some(doc) = pre_attempt_document {
+                        *self.ivars().ime_document.borrow_mut() = doc;
+                    }
                     unsafe { self.interpretKeyEvents(&events_for_nsview) };
                 }
                 self.ivars().key_characters.replace(outer_key);
-                self.ivars().in_key_down.set(false);
+                self.ivars().key_down_old_ime_state.set(outer_old_ime_state);
+                self.ivars().in_key_down.set(outer_in_key_down);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -1010,6 +1046,7 @@ impl WinitView {
             pending_ime_resets: RefCell::new(VecDeque::new()),
             forward_key_to_app: Default::default(),
             in_key_down: Default::default(),
+            key_down_old_ime_state: Default::default(),
             committed_in_key_down: Default::default(),
             key_interpreted: Default::default(),
             key_characters: Default::default(),
