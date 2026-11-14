@@ -586,6 +586,20 @@ impl UnownedWindow {
         self.shared_state.lock().unwrap()
     }
 
+    /// Flushes the requests of a setter that has no way to report failure.
+    ///
+    /// The setter sent its own requests with `expect_then_ignore_error`, so an error the Xlib
+    /// error handler stored by now came from an earlier request, often another library's on the
+    /// shared connection: a Mesa DRI3 `BadDrawable` (storytold/deckcraft#2086), a GLX
+    /// `BadIDChoice` (rust-windowing/winit#4615). The handler has already logged it. Panicking
+    /// here, with `shared_state` locked in `set_visible`, poisoned the lock, and the window's
+    /// `Drop` then aborted the process.
+    fn flush_setter_requests(&self, setter: &str) {
+        if let Err(err) = self.xconn.flush_requests() {
+            tracing::warn!("{setter}: ignoring an X11 error left by an earlier request: {err:?}");
+        }
+    }
+
     fn set_pid(&self) -> Result<Option<VoidCookie<'_>>, X11Error> {
         let atoms = self.xconn.atoms();
         let pid_atom = atoms[_NET_WM_PID];
@@ -651,7 +665,7 @@ impl UnownedWindow {
     pub fn set_theme(&self, theme: Option<Theme>) {
         self.set_theme_inner(theme).expect("Failed to change window theme").ignore_error();
 
-        self.xconn.flush_requests().expect("Failed to change window theme");
+        self.flush_setter_requests("set_theme");
     }
 
     fn set_netwm(
@@ -959,7 +973,7 @@ impl UnownedWindow {
         self.set_minimized_inner(minimized)
             .expect_then_ignore_error("Failed to change window minimization");
 
-        self.xconn.flush_requests().expect("Failed to change window minimization");
+        self.flush_setter_requests("set_minimized");
     }
 
     #[inline]
@@ -995,7 +1009,7 @@ impl UnownedWindow {
     pub fn set_maximized(&self, maximized: bool) {
         self.set_maximized_inner(maximized)
             .expect_then_ignore_error("Failed to change window maximization");
-        self.xconn.flush_requests().expect("Failed to change window maximization");
+        self.flush_setter_requests("set_maximized");
         self.invalidate_cached_frame_extents();
     }
 
@@ -1025,7 +1039,7 @@ impl UnownedWindow {
     pub fn set_title(&self, title: &str) {
         self.set_title_inner(title).expect_then_ignore_error("Failed to set window title");
 
-        self.xconn.flush_requests().expect("Failed to set window title");
+        self.flush_setter_requests("set_title");
     }
 
     #[inline]
@@ -1047,7 +1061,7 @@ impl UnownedWindow {
     pub fn set_decorations(&self, decorations: bool) {
         self.set_decorations_inner(decorations)
             .expect_then_ignore_error("Failed to set decoration state");
-        self.xconn.flush_requests().expect("Failed to set decoration state");
+        self.flush_setter_requests("set_decorations");
         self.invalidate_cached_frame_extents();
     }
 
@@ -1079,7 +1093,7 @@ impl UnownedWindow {
     pub fn set_window_level(&self, level: WindowLevel) {
         self.set_window_level_inner(level)
             .expect_then_ignore_error("Failed to set window-level state");
-        self.xconn.flush_requests().expect("Failed to set window-level state");
+        self.flush_setter_requests("set_window_level");
     }
 
     fn set_icon_inner(&self, icon: PlatformIcon) -> Result<VoidCookie<'_>, X11Error> {
@@ -1116,7 +1130,7 @@ impl UnownedWindow {
         }
         .expect_then_ignore_error("Failed to set icons");
 
-        self.xconn.flush_requests().expect("Failed to set icons");
+        self.flush_setter_requests("set_window_icon");
     }
 
     #[inline]
@@ -1142,14 +1156,14 @@ impl UnownedWindow {
                     &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
                 )
                 .expect_then_ignore_error("Failed to call `xcb_configure_window`");
-            self.xconn.flush_requests().expect("Failed to call XMapRaised");
+            self.flush_setter_requests("set_visible");
             shared_state.visibility = Visibility::YesWait;
         } else {
             self.xconn
                 .xcb_connection()
                 .unmap_window(self.xwindow)
                 .expect_then_ignore_error("Failed to call `xcb_unmap_window`");
-            self.xconn.flush_requests().expect("Failed to call XUnmapWindow");
+            self.flush_setter_requests("set_visible");
             shared_state.visibility = Visibility::No;
         }
     }
@@ -1273,7 +1287,7 @@ impl UnownedWindow {
                 &xproto::ConfigureWindowAux::new().width(width).height(height),
             )
             .expect_then_ignore_error("Failed to call `xcb_configure_window`");
-        self.xconn.flush_requests().expect("Failed to call XResizeWindow");
+        self.flush_setter_requests("request_inner_size");
         // cursor_hittest needs to be reapplied after each window resize.
         if self.shared_state_lock().cursor_hittest.unwrap_or(false) {
             let _ = self.set_cursor_hittest(true);
