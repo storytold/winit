@@ -1290,7 +1290,10 @@ impl InitData<'_> {
             unsafe { DeleteObject(region) };
         }
 
-        win.set_skip_taskbar(self.attributes.platform_specific.skip_taskbar);
+        win.set_skip_taskbar(
+            self.attributes.platform_specific.skip_taskbar
+                || self.attributes.platform_specific.tool_window,
+        );
         win.set_window_icon(self.attributes.window_icon.clone());
         win.set_taskbar_icon(self.attributes.platform_specific.taskbar_icon.clone());
 
@@ -1367,6 +1370,7 @@ unsafe fn init(
         .set(WindowFlags::NO_BACK_BUFFER, attributes.platform_specific.no_redirection_bitmap);
     window_flags.set(WindowFlags::MARKER_ACTIVATE, attributes.active);
     window_flags.set(WindowFlags::TRANSPARENT, attributes.transparent);
+    window_flags.set(WindowFlags::TOOL_WINDOW, attributes.platform_specific.tool_window);
     // WindowFlags::VISIBLE and MAXIMIZED are set down below after the window has been configured.
     window_flags.set(WindowFlags::RESIZABLE, attributes.resizable);
     // Will be changed later using `window.set_enabled_buttons` but we need to set a default here

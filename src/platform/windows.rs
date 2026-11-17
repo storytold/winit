@@ -499,6 +499,12 @@ pub trait WindowAttributesExtWindows {
     /// Whether show or hide the window icon in the taskbar.
     fn with_skip_taskbar(self, skip: bool) -> Self;
 
+    /// Requests the Windows tool-window style (`WS_EX_TOOLWINDOW`).
+    ///
+    /// Tool windows are created without taskbar or Alt-Tab entries. This defaults to `false`.
+    /// See <https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles>.
+    fn with_tool_window(self, tool_window: bool) -> Self;
+
     /// Customize the window class name.
     fn with_class_name<S: Into<String>>(self, class_name: S) -> Self;
 
@@ -571,6 +577,12 @@ impl WindowAttributesExtWindows for WindowAttributes {
     #[inline]
     fn with_skip_taskbar(mut self, skip: bool) -> Self {
         self.platform_specific.skip_taskbar = skip;
+        self
+    }
+
+    #[inline]
+    fn with_tool_window(mut self, tool_window: bool) -> Self {
+        self.platform_specific.tool_window = tool_window;
         self
     }
 

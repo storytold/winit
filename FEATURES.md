@@ -119,6 +119,7 @@ If your PR makes notable changes to Winit's features, please update this section
 ### Windows
 * Setting the name of the internal window class
 * Setting the taskbar icon
+* `WindowAttributesExtWindows::with_tool_window` requests a tool window without taskbar or Alt-Tab entries.
 * Setting the parent window
 * Setting a menu bar
 * `WS_EX_NOREDIRECTIONBITMAP` support

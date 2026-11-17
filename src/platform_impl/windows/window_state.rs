@@ -17,8 +17,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WINDOWPLACEMENT,
     WINDOW_EX_STYLE, WINDOW_STYLE, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_EX_ACCEPTFILES, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE,
-    WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SIZEBOX, WS_SYSMENU, WS_VISIBLE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SIZEBOX,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 /// Contains information about states and the window that the callback is going to use.
@@ -125,6 +126,7 @@ bitflags! {
         const MARKER_ACTIVATE = 1 << 21;
 
         const CLIP_CHILDREN = 1 << 22;
+        const TOOL_WINDOW = 1 << 23;
 
         const EXCLUSIVE_FULLSCREEN_OR_MASK = WindowFlags::ALWAYS_ON_TOP.bits();
     }
@@ -273,7 +275,9 @@ impl WindowFlags {
         if self.contains(WindowFlags::VISIBLE) {
             style |= WS_VISIBLE;
         }
-        if self.contains(WindowFlags::ON_TASKBAR) {
+        if self.contains(WindowFlags::TOOL_WINDOW) {
+            style_ex |= WS_EX_TOOLWINDOW;
+        } else if self.contains(WindowFlags::ON_TASKBAR) {
             style_ex |= WS_EX_APPWINDOW;
         }
         if self.contains(WindowFlags::ALWAYS_ON_TOP) {
@@ -555,5 +559,38 @@ impl CursorFlags {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tool_window_tests {
+    use super::WindowFlags;
+    use crate::platform::windows::WindowAttributesExtWindows;
+    use crate::window::WindowAttributes;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_SIZEBOX,
+    };
+
+    #[test]
+    fn tool_window_attributes_are_opt_in() {
+        let defaults = WindowAttributes::default();
+        assert!(!defaults.platform_specific.tool_window);
+        let attributes = defaults.with_tool_window(true).with_resizable(true);
+        assert!(attributes.platform_specific.tool_window);
+        assert!(attributes.resizable);
+        assert!(!attributes.with_tool_window(false).platform_specific.tool_window);
+    }
+
+    #[test]
+    fn tool_window_styles_keep_resizing_without_forcing_a_taskbar_entry() {
+        let normal = WindowFlags::ON_TASKBAR | WindowFlags::RESIZABLE;
+        let (style, extended) = (normal | WindowFlags::TOOL_WINDOW).to_window_styles();
+        assert_ne!(extended & WS_EX_TOOLWINDOW, 0);
+        assert_eq!(extended & WS_EX_APPWINDOW, 0);
+        assert_ne!(style & WS_SIZEBOX, 0);
+        let (style, extended) = normal.to_window_styles();
+        assert_eq!(extended & WS_EX_TOOLWINDOW, 0);
+        assert_ne!(extended & WS_EX_APPWINDOW, 0);
+        assert_ne!(style & WS_SIZEBOX, 0);
     }
 }
