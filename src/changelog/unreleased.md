@@ -47,3 +47,8 @@ changelog entry.
 - On Wayland, add `ActiveEventLoopExtWayland::clipboard` and `platform::wayland::Clipboard`, which
   read and write text on the clipboard through winit's data device, so toolkits don't need to bind
   a second one.
+
+### Fixed
+
+- On X11, preserve repeat identity across focus changes using the ordered focus keymap,
+  including when a held key is released before the client resumes event processing.

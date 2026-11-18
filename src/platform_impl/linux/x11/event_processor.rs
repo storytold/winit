@@ -5,13 +5,15 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::focus_keymap::FocusKeymap;
+
 use x11_dl::xinput2::{
     self, XIDeviceEvent, XIEnterEvent, XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent,
     XILeaveEvent, XIModifierState, XIRawEvent,
 };
 use x11_dl::xlib::{
     self, Display as XDisplay, Window as XWindow, XAnyEvent, XClientMessageEvent, XConfigureEvent,
-    XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
+    XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XKeymapEvent, XMapEvent, XPropertyEvent,
     XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
 };
 use x11rb::protocol::xinput;
@@ -62,6 +64,7 @@ pub struct EventProcessor {
     //
     // Used to detect key repeats.
     pub held_key_press: Option<u32>,
+    pub(super) focus_keymap: FocusKeymap,
     pub first_touch: Option<u64>,
     // Currently focused window belonging to this process
     pub active_window: Option<xproto::Window>,
@@ -212,6 +215,51 @@ impl EventProcessor {
         F: FnMut(&RootAEL, Event<T>),
     {
         let event_type = xev.get_type();
+
+        // Core KeymapNotify follows FocusIn in server order, even if dispatch is delayed.
+        // The extra core Focus/Enter subscriptions only supply provenance. XI2 keeps
+        // ownership of focus/IME and pointer delivery, so those copies bypass XIM.
+        // Existing KeymapNotify filtering still runs after its provenance is captured.
+        match event_type {
+            xlib::FocusIn => {
+                let focus: &xlib::XFocusChangeEvent = xev.as_ref();
+                if focus.send_event == 0 {
+                    let window = focus.window as xproto::Window;
+                    if self.window_exists(window) {
+                        self.focus_keymap.focus_in(window);
+                    } else {
+                        self.focus_keymap.cancel_pending();
+                    }
+                }
+                return;
+            },
+            xlib::FocusOut => {
+                let focus: &xlib::XFocusChangeEvent = xev.as_ref();
+                if focus.send_event == 0 {
+                    let window = focus.window as xproto::Window;
+                    self.focus_keymap.focus_out(window);
+                    if self.active_window == Some(window) {
+                        self.held_key_press = None;
+                    }
+                }
+                return;
+            },
+            xlib::EnterNotify => {
+                let enter: &xlib::XCrossingEvent = xev.as_ref();
+                if enter.send_event == 0 {
+                    // Its following window-less keymap belongs to pointer entry, not focus.
+                    self.focus_keymap.cancel_pending();
+                }
+                return;
+            },
+            xlib::KeymapNotify => {
+                let keymap: &XKeymapEvent = xev.as_ref();
+                if keymap.send_event == 0 {
+                    self.focus_keymap_notify(keymap, &mut callback);
+                }
+            },
+            _ => (),
+        }
 
         // If we have IME disabled, don't try to `filter_event`, since only IME can consume them
         // and forward back. This is not desired for e.g. games since some IMEs may delay the input
@@ -895,6 +943,7 @@ impl EventProcessor {
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
 
+        self.focus_keymap.focus_out(window);
         self.ime_compositions.end(window as XWindow);
 
         // In the event that the window's been destroyed without being dropped first, we
@@ -983,12 +1032,27 @@ impl EventProcessor {
 
         let keycode = xev.keycode as _;
 
+        // Accept the focus window's native children, but never retarget an older
+        // unrelated window's XIM replay or release after focus has moved.
+        let windows = wt.windows.borrow();
+        let Some(focus_repeat) = self.focus_keymap.key_event_from(
+            window,
+            xev.window as xproto::Window,
+            keycode,
+            state == ElementState::Pressed,
+            windows.len(),
+            |source| {
+                windows.get(&WindowId(source as _))?.upgrade().map(|window| window.parent_window())
+            },
+        ) else {
+            return;
+        };
+        drop(windows);
+
         // Update state to track key repeats and determine whether this key was a repeat.
         //
-        // Note, when a key is held before focusing on this window the first
-        // (non-synthetic) event will not be flagged as a repeat (also note that the
-        // synthetic press event that is generated before this when the window gains focus
-        // will also not be flagged as a repeat).
+        // The per-press tracker has no history for keys held before focus gain.
+        // The event-ordered focus keymap below supplies that missing provenance.
         //
         // Only keys that can repeat should change the held_key_press state since a
         // continuously held repeatable key may continue repeating after the press of a
@@ -1013,6 +1077,8 @@ impl EventProcessor {
         } else {
             false
         };
+
+        let repeat = repeat || focus_repeat;
 
         // NOTE: When the modifier was captured by the XFilterEvents the modifiers for the modifier
         // itself are out of sync due to XkbState being delivered before XKeyEvent, since it's
@@ -1346,14 +1412,8 @@ impl EventProcessor {
         let event = Event::WindowEvent { window_id, event: WindowEvent::Focused(true) };
         callback(&self.target, event);
 
-        // Issue key press events for all pressed keys
-        Self::handle_pressed_keys(
-            &self.target,
-            window_id,
-            ElementState::Pressed,
-            &mut self.xkb_context,
-            &mut callback,
-        );
+        // Held-key presses arrive from the ordered core FocusIn/KeymapNotify pair.
+        // A new XQueryKeymap here could already observe a queued release or fresh press.
 
         self.update_mods_from_query(window_id, &mut callback);
 
@@ -1394,6 +1454,8 @@ impl EventProcessor {
         if self.active_window.take() == Some(window) {
             let window_id = mkwid(window);
 
+            self.focus_keymap.focus_out(window);
+
             wt.update_listen_device_events(false);
 
             // Clear the modifiers when unfocusing the window.
@@ -1404,10 +1466,12 @@ impl EventProcessor {
             }
 
             // Issue key release events for all pressed keys
+            let keys = wt.xconn.query_keymap();
             Self::handle_pressed_keys(
                 &self.target,
                 window_id,
                 ElementState::Released,
+                &keys,
                 &mut self.xkb_context,
                 &mut callback,
             );
@@ -1847,10 +1911,34 @@ impl EventProcessor {
         }
     }
 
+    fn focus_keymap_notify<T: 'static, F>(&mut self, xev: &XKeymapEvent, callback: &mut F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        // The protocol payload has no window; only the immediately preceding core FocusIn
+        // gives it authority. Pointer-enter and unrelated keymaps cannot retarget a hold.
+        let keys = xev.key_vector.map(|byte| byte as u8);
+        let Some(window) = self.focus_keymap.keymap_notify(keys) else { return };
+        if !self.window_exists(window) {
+            self.focus_keymap.focus_out(window);
+            return;
+        }
+        let keymap = util::keys::Keymap::from(keys);
+        Self::handle_pressed_keys(
+            &self.target,
+            mkwid(window),
+            ElementState::Pressed,
+            &keymap,
+            &mut self.xkb_context,
+            callback,
+        );
+    }
+
     fn handle_pressed_keys<T: 'static, F>(
         target: &RootAEL,
         window_id: crate::window::WindowId,
         state: ElementState,
+        keys: &util::keys::Keymap,
         xkb_context: &mut Context,
         callback: &mut F,
     ) where
@@ -1877,9 +1965,7 @@ impl EventProcessor {
             None => return,
         };
 
-        for keycode in
-            window_target.xconn.query_keymap().into_iter().filter(|k| *k >= KEYCODE_OFFSET)
-        {
+        for keycode in keys.into_iter().filter(|k| *k >= KEYCODE_OFFSET) {
             let event = key_processor.process_key_event(keycode as u32, state, false);
             let event = Event::WindowEvent {
                 window_id,

@@ -41,6 +41,7 @@ mod atoms;
 mod dnd;
 mod event_processor;
 pub mod ffi;
+mod focus_keymap;
 mod ime;
 mod monitor;
 mod util;
@@ -325,6 +326,7 @@ impl<T: 'static> EventLoop<T> {
             xkb_context,
             num_touch: 0,
             held_key_press: None,
+            focus_keymap: Default::default(),
             first_touch: None,
             active_window: None,
             modifiers: Default::default(),

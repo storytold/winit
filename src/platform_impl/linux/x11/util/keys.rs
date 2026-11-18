@@ -7,6 +7,12 @@ pub struct Keymap {
     keys: [u8; 32],
 }
 
+impl From<[u8; 32]> for Keymap {
+    fn from(keys: [u8; 32]) -> Self {
+        Self { keys }
+    }
+}
+
 pub struct KeymapIter<'a> {
     iter: Enumerate<Iter<'a, u8>>,
     index: usize,

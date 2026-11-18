@@ -114,6 +114,7 @@ pub struct UnownedWindow {
     #[allow(dead_code)]
     visual: u32, // never changes
     root: xproto::Window,               // never changes
+    parent: xproto::Window,             // native creation parent, including XEmbed
     #[allow(dead_code)]
     screen_id: i32, // never changes
     selected_cursor: Mutex<SelectedCursor>,
@@ -267,6 +268,8 @@ impl UnownedWindow {
                 | EventMask::KEY_PRESS
                 | EventMask::KEY_RELEASE
                 | EventMask::KEYMAP_STATE
+                | EventMask::FOCUS_CHANGE
+                | EventMask::ENTER_WINDOW
                 | EventMask::BUTTON_PRESS
                 | EventMask::BUTTON_RELEASE
                 | EventMask::POINTER_MOTION
@@ -343,6 +346,7 @@ impl UnownedWindow {
             xwindow: xwindow as xproto::Window,
             visual,
             root,
+            parent,
             screen_id,
             selected_cursor: Default::default(),
             cursor_grabbed_mode: Mutex::new(CursorGrabMode::None),
@@ -1457,6 +1461,10 @@ impl UnownedWindow {
     #[inline]
     pub fn xlib_window(&self) -> c_ulong {
         self.xwindow as ffi::Window
+    }
+
+    pub(super) fn parent_window(&self) -> xproto::Window {
+        self.parent
     }
 
     #[inline]
