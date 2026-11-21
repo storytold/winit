@@ -335,6 +335,10 @@ pub trait WindowAttributesExtMacOS {
     fn with_option_as_alt(self, option_as_alt: OptionAsAlt) -> Self;
     /// See [`WindowExtMacOS::set_borderless_game`] for details on what this means if set.
     fn with_borderless_game(self, borderless_game: bool) -> Self;
+    /// Makes the window a utility panel: an `NSPanel` with the small title bar, which doesn't
+    /// become the main window, isn't listed in the Window menu and hides while the app is
+    /// inactive. For palettes and modeless dialogs such as Find. The default is `false`.
+    fn with_panel(self, panel: bool) -> Self;
 }
 
 impl WindowAttributesExtMacOS for WindowAttributes {
@@ -407,6 +411,12 @@ impl WindowAttributesExtMacOS for WindowAttributes {
     #[inline]
     fn with_borderless_game(mut self, borderless_game: bool) -> Self {
         self.platform_specific.borderless_game = borderless_game;
+        self
+    }
+
+    #[inline]
+    fn with_panel(mut self, panel: bool) -> Self {
+        self.platform_specific.panel = panel;
         self
     }
 }
