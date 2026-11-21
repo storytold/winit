@@ -1572,6 +1572,7 @@ unsafe fn public_window_callback_inner(
                 let ime_context = unsafe { ImeContext::current(window) };
 
                 if lparam == 0 {
+                    userdata.window_state_lock().ime_state = ImeState::Enabled;
                     events.push(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 }
 
@@ -1579,10 +1580,8 @@ unsafe fn public_window_callback_inner(
                 // first, receive composing result if exist.
                 if (lparam as u32 & GCS_RESULTSTR) != 0 {
                     if let Some(text) = unsafe { ime_context.get_composed_text() } {
-                        userdata.window_state_lock().ime_state = ImeState::Enabled;
-
-                        events.push(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
-                        events.push(WindowEvent::Ime(Ime::Commit(text)));
+                        let mut w = userdata.window_state_lock();
+                        apply_windows_resultstr_update(&mut w.ime_state, text, &mut events);
                     }
                 }
 
@@ -1591,10 +1590,8 @@ unsafe fn public_window_callback_inner(
                     if let Some((text, first, last)) =
                         unsafe { ime_context.get_composing_text_and_cursor(lparam as u32) }
                     {
-                        userdata.window_state_lock().ime_state = ImeState::Preedit;
-                        let cursor_range = first.map(|f| (f, last.unwrap_or(f)));
-
-                        events.push(WindowEvent::Ime(Ime::Preedit(text, cursor_range)));
+                        let mut w = userdata.window_state_lock();
+                        apply_windows_compstr_update(&mut w.ime_state, text, first, last, &mut events);
                     }
                 }
                 userdata.publish_ime_batch(window, events);
@@ -1611,19 +1608,18 @@ unsafe fn public_window_callback_inner(
             };
             if ime_allowed_or_composing {
                 let mut events = Vec::new();
-                if userdata.window_state_lock().ime_state == ImeState::Preedit {
-                    // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
-                    // trying receiving composing result and commit if exists.
-                    let ime_context = unsafe { ImeContext::current(window) };
-                    if let Some(text) = unsafe { ime_context.get_composed_text() } {
-                        events.push(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
-                        events.push(WindowEvent::Ime(Ime::Commit(text)));
-                    }
-                }
-
+                let was_preedit = userdata.window_state_lock().ime_state == ImeState::Preedit;
+                apply_windows_end_composition(
+                    was_preedit,
+                    || {
+                        // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION,
+                        // so trying receiving composing result and commit if non-empty.
+                        let ime_context = unsafe { ImeContext::current(window) };
+                        unsafe { ime_context.get_composed_text() }
+                    },
+                    &mut events,
+                );
                 userdata.window_state_lock().ime_state = ImeState::Disabled;
-
-                events.push(WindowEvent::Ime(Ime::Disabled));
                 userdata.publish_ime_batch(window, events);
             }
 
@@ -2864,5 +2860,132 @@ mod ime_reset_pending_message_tests {
             DestroyWindow(second);
             UnregisterClassW(name.as_ptr(), instance);
         }
+    }
+}
+
+/// Apply one `WM_IME_COMPOSITION` `GCS_RESULTSTR` payload to `ime_state` and `events`.
+///
+/// Resets `ime_state` to `ImeState::Enabled`, clears the active pre-edit, and emits
+/// `Ime::Commit(text)` only when `text` is non-empty so an empty IMM32 result buffer does not
+/// delete an existing selection in downstream editors.
+fn apply_windows_resultstr_update(
+    ime_state: &mut ImeState,
+    text: String,
+    events: &mut Vec<WindowEvent>,
+) {
+    *ime_state = ImeState::Enabled;
+    events.push(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+    if !text.is_empty() {
+        events.push(WindowEvent::Ime(Ime::Commit(text)));
+    }
+}
+
+/// Apply one `WM_IME_COMPOSITION` `GCS_COMPSTR` payload to `ime_state` and `events`.
+///
+/// An empty composition string (for example Backspace deleting the final composing Korean jamo)
+/// ends the active pre-edit and transitions back to `ImeState::Enabled` with `None` cursor range,
+/// preventing the following `WM_IME_ENDCOMPOSITION` from querying a stale `GCS_RESULTSTR`.
+fn apply_windows_compstr_update(
+    ime_state: &mut ImeState,
+    text: String,
+    first: Option<usize>,
+    last: Option<usize>,
+    events: &mut Vec<WindowEvent>,
+) {
+    if text.is_empty() {
+        *ime_state = ImeState::Enabled;
+        events.push(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+    } else {
+        *ime_state = ImeState::Preedit;
+        let cursor_range = first.map(|f| (f, last.unwrap_or(f)));
+        events.push(WindowEvent::Ime(Ime::Preedit(text, cursor_range)));
+    }
+}
+
+/// Apply `WM_IME_ENDCOMPOSITION` to `events` given whether a pre-edit was still active.
+///
+/// Only queries `composed` (`GCS_RESULTSTR`) when `was_preedit` is true, clears the pre-edit,
+/// and omits empty `Ime::Commit("")` events so a cleared composition does not delete an existing
+/// selection in downstream editors.
+fn apply_windows_end_composition(
+    was_preedit: bool,
+    composed: impl FnOnce() -> Option<String>,
+    events: &mut Vec<WindowEvent>,
+) {
+    if was_preedit {
+        events.push(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+        if let Some(text) = composed().filter(|text| !text.is_empty()) {
+            events.push(WindowEvent::Ime(Ime::Commit(text)));
+        }
+    }
+    events.push(WindowEvent::Ime(Ime::Disabled));
+}
+
+#[cfg(test)]
+mod windows_ime_composition_tests {
+    use super::{
+        apply_windows_compstr_update, apply_windows_end_composition, apply_windows_resultstr_update,
+    };
+    use crate::event::{Ime, WindowEvent};
+    use crate::platform_impl::platform::window_state::ImeState;
+
+    #[test]
+    fn resultstr_commits_nonempty_and_omits_empty_commit() {
+        let mut state = ImeState::Preedit;
+        let mut events = Vec::new();
+        apply_windows_resultstr_update(&mut state, "한".into(), &mut events);
+        assert!(state == ImeState::Enabled);
+        assert_eq!(events, vec![
+            WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+            WindowEvent::Ime(Ime::Commit("한".into())),
+        ]);
+
+        state = ImeState::Preedit;
+        events.clear();
+        apply_windows_resultstr_update(&mut state, String::new(), &mut events);
+        assert!(state == ImeState::Enabled);
+        assert_eq!(events, vec![WindowEvent::Ime(Ime::Preedit(String::new(), None))]);
+    }
+
+    #[test]
+    fn empty_compstr_exits_preedit_and_skips_stale_end_composition_commit() {
+        let mut state = ImeState::Enabled;
+        let mut events = Vec::new();
+        apply_windows_compstr_update(&mut state, "ㄴ".into(), Some(3), Some(3), &mut events);
+        assert!(state == ImeState::Preedit);
+        assert_eq!(events, vec![WindowEvent::Ime(Ime::Preedit("ㄴ".into(), Some((3, 3))))]);
+
+        events.clear();
+        // Backspace deletes the only composing jamo: Windows sends GCS_COMPSTR with "".
+        apply_windows_compstr_update(&mut state, String::new(), Some(0), Some(0), &mut events);
+        assert!(state == ImeState::Enabled);
+        assert_eq!(events, vec![WindowEvent::Ime(Ime::Preedit(String::new(), None))]);
+
+        events.clear();
+        // The following WM_IME_ENDCOMPOSITION must not query GCS_RESULTSTR or re-commit stale text.
+        apply_windows_end_composition(
+            state == ImeState::Preedit,
+            || panic!("stale GCS_RESULTSTR must not be queried after empty GCS_COMPSTR"),
+            &mut events,
+        );
+        assert_eq!(events, vec![WindowEvent::Ime(Ime::Disabled)]);
+    }
+
+    #[test]
+    fn end_composition_while_composing_commits_nonempty_and_omits_empty_commit() {
+        let mut events = Vec::new();
+        apply_windows_end_composition(true, || Some("한".into()), &mut events);
+        assert_eq!(events, vec![
+            WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+            WindowEvent::Ime(Ime::Commit("한".into())),
+            WindowEvent::Ime(Ime::Disabled),
+        ]);
+
+        events.clear();
+        apply_windows_end_composition(true, || Some(String::new()), &mut events);
+        assert_eq!(events, vec![
+            WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+            WindowEvent::Ime(Ime::Disabled),
+        ]);
     }
 }
