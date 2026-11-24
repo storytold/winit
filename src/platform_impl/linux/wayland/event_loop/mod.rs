@@ -361,8 +361,13 @@ impl<T: 'static> EventLoop<T> {
         // Drain the pending compositor updates.
         self.with_state(|state| compositor_updates.append(&mut state.window_compositor_updates));
 
+        // Windows that had input, focus or a configure in this turn: the compositor is showing
+        // them, so a redraw need not wait for a frame callback that is overdue (W43).
+        let mut active_windows: Vec<WindowId> = Vec::new();
+
         for mut compositor_update in compositor_updates.drain(..) {
             let window_id = compositor_update.window_id;
+            active_windows.push(window_id);
             if compositor_update.scale_changed {
                 let (physical_size, scale_factor) = self.with_state(|state| {
                     let windows = state.windows.get_mut();
@@ -487,6 +492,9 @@ impl<T: 'static> EventLoop<T> {
                 })
             },
             |this, event, delete| {
+                if let Event::WindowEvent { window_id, .. } = &event {
+                    active_windows.push(window_id.0);
+                }
                 // Attach deletion only to the actual commit callback.
                 if let Event::WindowEvent { window_id, event: WindowEvent::Ime(Ime::Commit(_)) } =
                     &event
@@ -500,6 +508,15 @@ impl<T: 'static> EventLoop<T> {
                 callback(event, &this.window_target);
             },
         );
+
+        self.with_state(|state| {
+            let windows = state.windows.get_mut();
+            for window_id in active_windows.drain(..) {
+                if let Some(window) = windows.get(&window_id) {
+                    window.lock().unwrap().note_activity();
+                }
+            }
+        });
 
         // Collect the window ids
         self.with_state(|state| {
@@ -521,7 +538,14 @@ impl<T: 'static> EventLoop<T> {
                     state.windows.get_mut().get_mut(window_id).unwrap().lock().unwrap();
 
                 if window.frame_callback_state() == FrameCallbackState::Requested {
-                    return None;
+                    // Keep waiting, unless the callback is lost: the window is in use but its
+                    // callback has not come (W43).
+                    let pending = window.frame_callback_overdue(Instant::now())?;
+                    warn!(
+                        "frame callback pending for {:.1}s on a window in use; redrawing without \
+                         it",
+                        pending.as_secs_f32()
+                    );
                 }
 
                 // Reset the frame callbacks state.

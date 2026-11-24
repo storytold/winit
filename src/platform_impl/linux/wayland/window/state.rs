@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ahash::HashSet;
 use tracing::{info, warn};
@@ -261,6 +261,13 @@ pub struct WindowState {
     /// The state of the frame callback.
     frame_callback_state: FrameCallbackState,
 
+    /// When the frame callback in flight was requested.
+    frame_callback_requested_at: Option<Instant>,
+
+    /// Whether the window had input, focus or a configure since the frame callback in flight was
+    /// requested.
+    active_since_frame_request: bool,
+
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     blur: Option<OrgKdeKwinBlur>,
@@ -316,6 +323,8 @@ impl WindowState {
             fractional_scale,
             frame: None,
             frame_callback_state: FrameCallbackState::None,
+            frame_callback_requested_at: None,
+            active_since_frame_request: false,
             seat_focus: Default::default(),
             has_pending_move: None,
             ime_allowed: false,
@@ -366,11 +375,30 @@ impl WindowState {
     /// The frame callback was received, but not yet sent to the user.
     pub fn frame_callback_received(&mut self) {
         self.frame_callback_state = FrameCallbackState::Received;
+        self.frame_callback_requested_at = None;
     }
 
     /// Reset the frame callbacks state.
     pub fn frame_callback_reset(&mut self) {
         self.frame_callback_state = FrameCallbackState::None;
+        self.frame_callback_requested_at = None;
+    }
+
+    /// The window had input, focus or a configure: the compositor is showing it to the user.
+    pub fn note_activity(&mut self) {
+        if self.frame_callback_state == FrameCallbackState::Requested {
+            self.active_since_frame_request = true;
+        }
+    }
+
+    /// Whether to stop waiting for the frame callback in flight (see [`frame_callback_lost`]).
+    pub fn frame_callback_overdue(&self, now: Instant) -> Option<Duration> {
+        frame_callback_lost(
+            self.frame_callback_state,
+            self.frame_callback_requested_at,
+            self.active_since_frame_request,
+            now,
+        )
     }
 
     /// Request a frame callback if we don't have one for this window in flight.
@@ -379,6 +407,8 @@ impl WindowState {
         match self.frame_callback_state {
             FrameCallbackState::None | FrameCallbackState::Received => {
                 self.frame_callback_state = FrameCallbackState::Requested;
+                self.frame_callback_requested_at = Some(Instant::now());
+                self.active_since_frame_request = false;
                 surface.frame(&self.queue_handle, surface.clone());
             },
             FrameCallbackState::Requested => (),
@@ -1580,6 +1610,31 @@ impl GrabState {
     }
 }
 
+/// How long a frame callback may stay pending on a window in use before redraws stop waiting for
+/// it.
+pub const FRAME_CALLBACK_GRACE: Duration = Duration::from_secs(1);
+
+/// Whether a frame callback is lost: requested more than [`FRAME_CALLBACK_GRACE`] ago and not
+/// answered, although the window had input, focus or a configure since. Returns how long it has
+/// been pending.
+///
+/// Redraws wait for the frame callback of the last frame, and the next frame is what requests the
+/// next callback. A compositor withholds callbacks from a window it isn't showing (GNOME, a covered
+/// window), and some setups lose one for a window that is shown (a capture tool, presenting across
+/// GPUs). Without this, a lost callback stops the window for good: no `RedrawRequested`, so no
+/// frame, so no new callback, while input still arrives. A window that gets input or focus is
+/// being shown, so drawing it is safe; a hidden one keeps waiting, as it gets neither.
+pub fn frame_callback_lost(
+    state: FrameCallbackState,
+    requested_at: Option<Instant>,
+    active_since: bool,
+    now: Instant,
+) -> Option<Duration> {
+    let pending = now.saturating_duration_since(requested_at?);
+    (state == FrameCallbackState::Requested && active_since && pending >= FRAME_CALLBACK_GRACE)
+        .then_some(pending)
+}
+
 /// The state of the frame callback.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameCallbackState {
@@ -1614,5 +1669,42 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
         Some(Theme::Light) => sctk_adwaita::FrameConfig::light(),
         Some(Theme::Dark) => sctk_adwaita::FrameConfig::dark(),
         None => sctk_adwaita::FrameConfig::auto(),
+    }
+}
+
+#[cfg(test)]
+mod frame_callback_tests {
+    use super::*;
+
+    #[test]
+    fn a_window_in_use_stops_waiting_for_a_lost_callback() {
+        let at = Instant::now();
+        let later = at + FRAME_CALLBACK_GRACE + Duration::from_millis(1);
+        assert!(frame_callback_lost(FrameCallbackState::Requested, Some(at), true, later).is_some());
+    }
+
+    #[test]
+    fn a_hidden_window_keeps_waiting() {
+        let at = Instant::now();
+        let later = at + FRAME_CALLBACK_GRACE * 100;
+        assert!(
+            frame_callback_lost(FrameCallbackState::Requested, Some(at), false, later).is_none()
+        );
+    }
+
+    #[test]
+    fn a_callback_is_given_its_time_first() {
+        let at = Instant::now();
+        let soon = at + FRAME_CALLBACK_GRACE / 2;
+        assert!(frame_callback_lost(FrameCallbackState::Requested, Some(at), true, soon).is_none());
+    }
+
+    #[test]
+    fn only_a_pending_callback_is_lost() {
+        let at = Instant::now();
+        let later = at + FRAME_CALLBACK_GRACE * 2;
+        for state in [FrameCallbackState::None, FrameCallbackState::Received] {
+            assert!(frame_callback_lost(state, Some(at), true, later).is_none());
+        }
     }
 }
