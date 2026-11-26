@@ -185,7 +185,7 @@ pub enum WindowEvent {
     /// separately.
     HoveredFile(PathBuf),
 
-    /// A file drag has entered or moved over the window at the given physical client-area position.
+    /// A file drag entered or moved over the window at the given physical position.
     HoveredFileMoved(PhysicalPosition<f64>),
 
     /// A file was hovered, but has exited the window.
