@@ -35,6 +35,7 @@ input lives in `craft-tablet`).
 | W26 | `2b9cd1cf` | macOS: replaced text is deleted by UTF-8 byte count with the commit (`WindowExtMacOS::take_ime_delete_surrounding`, same shape as W27) | master: `Ime::DeleteSurrounding` (a new `Ime` variant breaks 0.30 matchers) | the egui → 0.31 move | storytold/winit PR #6 (`d103edae`) |
 | W27 | `f40c76a2` | Wayland: text-input-v3 surrounding text (`WindowExtWayland::set_ime_surrounding_text`, `set_ime_surrounding_text_with_change_cause`, `clear_ime_surrounding_text`), delete-surrounding attached to the commit (`take_ime_delete_surrounding` → `ImeDeleteSurrounding { before_bytes, after_bytes }`), per-seat preedit ownership and outgoing state waiting for a matching `done` (E21b) | master has both as core API (`Ime::DeleteSurrounding`) | the egui → 0.31 move | storytold/winit PR #7; craft-libs#198 (I7) |
 | W30 | this commit | Linux: the first window created without an activation token takes the launcher's (`XDG_ACTIVATION_TOKEN` on Wayland, `DESKTOP_STARTUP_ID` on X11) and hands it back as one given through `with_activation_token` would be (`platform_impl/linux/startup_token.rs`), so GNOME drops the busy cursor and a Wayland window opens focused; later windows don't reuse the spent token, an empty or oversized (over 1,024 bytes) token is ignored, and the variable stays in the environment (changing it while other threads may read it is unsound) | none; to be proposed | upstream release that hands the launcher's token to the first window | pdfcraft vendor patch (14); cadcraft#2030 (`tests/winit_startup_token.rs`) |
+| W45 | this branch | Wayland: forward surface-local drag coordinates from `wl_data_device` `enter`/`motion` as `WindowEvent::HoveredFileMoved(PhysicalPosition<f64>)` (scaled by the window's scale factor, frozen after drop) and emit `HoveredFileCancelled` on cancel or empty `text/uri-list` drop; adds a `WindowEvent` variant (not `#[non_exhaustive]`, paired with `storytold/egui#17`) | none; to be proposed with W15 (#4729) | same as W15 | storytold/photocraft#10225; storytold/winit#29 |
 
 Conflict resolved by hand: `wayland/seat/mod.rs` `remove_seat` keeps all three cleanups — cancel a
 file drag (W15), remove the seat from winit's clipboard (W15), destroy the seat's text input (W2).
@@ -222,3 +223,18 @@ cross-compilation checks for Windows x86_64 GNU and macOS AArch64. Cross-compila
 execute native tests. The main-thread AppKit harness, Windows native message/IMM tests, live
 XIM/Wayland input methods, matching egui adapter and downstream custom editors remain separate
 qualification gates. Human review and merge are required.
+
+
+## W45: Wayland file drag coordinates (`WindowEvent::HoveredFileMoved`)
+
+Forwards surface-local drag coordinates from `wl_data_device::enter` and `wl_data_device::motion`
+in `src/platform_impl/linux/wayland/seat/dnd.rs` as
+`WindowEvent::HoveredFileMoved(PhysicalPosition<f64>)` scaled by the target window's scale factor
+(`storytold/photocraft#10225`). Motion after `drop_performed` is ignored so the final drop position
+stays frozen while `text/uri-list` is read, and cancelling an active file drag or completing a
+`text/uri-list` drop with no local `file://` URIs emits `WindowEvent::HoveredFileCancelled` so
+downstream integrations do not leak drag coordinates into later drags.
+
+**API note:** `WindowEvent` is not `#[non_exhaustive]`, so downstream exhaustive matches on
+`WindowEvent` need a `WindowEvent::HoveredFileMoved` arm (`storytold/egui#17` updates
+`egui-winit`).
