@@ -254,6 +254,56 @@ pub type GetPointerTouchInfo =
 pub type GetPointerPenInfo =
     unsafe extern "system" fn(point_id: u32, pen_info: *mut POINTER_PEN_INFO) -> BOOL;
 
+#[repr(C)]
+#[derive(Default)]
+struct InputMessageSource {
+    device_type: u32,
+    origin_id: u32,
+}
+
+type GetCurrentInputMessageSource =
+    unsafe extern "system" fn(input_message_source: *mut InputMessageSource) -> BOOL;
+type RegisterTouchpadCapableThread = unsafe extern "system" fn(enable: BOOL) -> BOOL;
+
+const IMDT_TOUCHPAD: u32 = 0x10;
+
+static GET_CURRENT_INPUT_MESSAGE_SOURCE: Lazy<Option<GetCurrentInputMessageSource>> =
+    Lazy::new(|| get_function!("user32.dll", GetCurrentInputMessageSource));
+static REGISTER_TOUCHPAD_CAPABLE_THREAD: Lazy<Option<RegisterTouchpadCapableThread>> =
+    Lazy::new(|| {
+        get_function!("user32.dll", RegisterTouchpadCapableThread).or_else(|| {
+            // Windows documents this function as user32 ordinal 2688. Keep ordinal lookup
+            // behind the Windows 11 build check at the call site because older DLLs may reuse it.
+            let module = unsafe { LoadLibraryA(b"user32.dll\0".as_ptr()) };
+            if module == 0 {
+                return None;
+            }
+            unsafe { GetProcAddress(module, 2688usize as *const u8) }
+                .map(|function| unsafe { mem::transmute(function as *const c_void) })
+        })
+    });
+
+pub(crate) fn current_input_is_touchpad() -> bool {
+    let Some(get_source) = *GET_CURRENT_INPUT_MESSAGE_SOURCE else {
+        return false;
+    };
+
+    let mut source = InputMessageSource::default();
+    unsafe { get_source(&mut source) != 0 && source.device_type == IMDT_TOUCHPAD }
+}
+
+pub(crate) fn register_touchpad_capable_thread() -> bool {
+    REGISTER_TOUCHPAD_CAPABLE_THREAD
+        .and_then(|register| (unsafe { register(1) } != 0).then_some(()))
+        .is_some()
+}
+
+pub(crate) fn unregister_touchpad_capable_thread() {
+    if let Some(register) = *REGISTER_TOUCHPAD_CAPABLE_THREAD {
+        unsafe { register(0) };
+    }
+}
+
 pub(crate) static GET_DPI_FOR_WINDOW: Lazy<Option<GetDpiForWindow>> =
     Lazy::new(|| get_function!("user32.dll", GetDpiForWindow));
 pub(crate) static ADJUST_WINDOW_RECT_EX_FOR_DPI: Lazy<Option<AdjustWindowRectExForDpi>> =

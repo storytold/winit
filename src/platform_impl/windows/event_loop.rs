@@ -170,6 +170,7 @@ pub struct EventLoop<T: 'static> {
     // It is created lazily in case if we have `ControlFlow::WaitUntil`.
     // Keep it as a field to avoid recreating it on every `ControlFlow::WaitUntil`.
     high_resolution_timer: Option<OwnedHandle>,
+    touchpad_capable: bool,
 }
 
 pub(crate) struct PlatformSpecificEventLoopAttributes {
@@ -209,7 +210,11 @@ impl<T: 'static> EventLoop<T> {
             become_dpi_aware();
         }
 
+        // This API is only available starting with Windows 11. Loading it dynamically keeps
+        // support for older Windows versions, where touchpad gestures remain legacy mouse input.
         let thread_msg_target = create_event_target_window();
+        let touchpad_capable = WIN10_BUILD_VERSION.is_some_and(|build| build >= 22000)
+            && util::register_touchpad_capable_thread();
 
         let runner_shared = Rc::new(EventLoopRunner::new(thread_msg_target));
 
@@ -229,6 +234,7 @@ impl<T: 'static> EventLoop<T> {
             },
             msg_hook: attributes.msg_hook.take(),
             high_resolution_timer: None,
+            touchpad_capable,
         })
     }
 
@@ -632,6 +638,9 @@ impl<T> Drop for EventLoop<T> {
         unsafe {
             DestroyWindow(self.window_target.p.thread_msg_target);
         }
+        if self.touchpad_capable {
+            util::unregister_touchpad_capable_thread();
+        }
     }
 }
 
@@ -1030,6 +1039,19 @@ fn normalize_pointer_pressure(pressure: u32) -> Option<Force> {
         1..=1024 => Some(Force::Normalized(pressure as f64 / 1024.0)),
         _ => None,
     }
+}
+
+// One 120-unit wheel detent maps to roughly four percent magnification.
+const TOUCHPAD_ZOOM_PER_WHEEL_LINE: f64 = 0.04;
+
+fn touchpad_pinch_delta(
+    device_is_touchpad: bool,
+    ctrl_pressed: bool,
+    wheel_delta: i16,
+) -> Option<f64> {
+    (device_is_touchpad && ctrl_pressed).then_some(
+        f64::from(wheel_delta) / f64::from(WHEEL_DELTA) * TOUCHPAD_ZOOM_PER_WHEEL_LINE,
+    )
 }
 
 /// Emit a `ModifiersChanged` event whenever modifiers have changed.
@@ -1746,17 +1768,29 @@ unsafe fn public_window_callback_inner(
         WM_MOUSEWHEEL => {
             use crate::event::MouseScrollDelta::LineDelta;
 
-            let value = (wparam >> 16) as i16;
-            let value = value as f32 / WHEEL_DELTA as f32;
+            let wheel_delta = (wparam >> 16) as i16;
+            let value = wheel_delta as f32 / WHEEL_DELTA as f32;
 
             update_modifiers(window, userdata);
 
+            let pinch_delta = touchpad_pinch_delta(
+                util::current_input_is_touchpad(),
+                wparam & 0x0008 != 0, // MK_CONTROL
+                wheel_delta,
+            );
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: WindowEvent::MouseWheel {
-                    device_id: DEVICE_ID,
-                    delta: LineDelta(0.0, value),
-                    phase: TouchPhase::Moved,
+                event: match pinch_delta {
+                    Some(delta) => WindowEvent::PinchGesture {
+                        device_id: DEVICE_ID,
+                        delta,
+                        phase: TouchPhase::Moved,
+                    },
+                    None => WindowEvent::MouseWheel {
+                        device_id: DEVICE_ID,
+                        delta: LineDelta(0.0, value),
+                        phase: TouchPhase::Moved,
+                    },
                 },
             });
 
@@ -2002,7 +2036,11 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
-            if let (
+            if util::current_input_is_touchpad() {
+                // Let Windows turn precision-touchpad gestures into legacy mouse-wheel
+                // messages. The input source remains identifiable on WM_MOUSEWHEEL.
+                result = ProcResult::DefWindowProc(wparam);
+            } else if let (
                 Some(GetPointerFrameInfoHistory),
                 Some(SkipPointerFrameMessages),
                 Some(GetPointerDeviceRects),
@@ -2775,6 +2813,25 @@ mod ime_reset_transport_tests {
                 request
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod touchpad_zoom_tests {
+    use super::{WHEEL_DELTA, touchpad_pinch_delta};
+
+    #[test]
+    fn only_ctrl_wheel_from_a_touchpad_becomes_a_pinch() {
+        assert_eq!(
+            touchpad_pinch_delta(true, true, WHEEL_DELTA as i16),
+            Some(0.04)
+        );
+        assert_eq!(touchpad_pinch_delta(true, false, WHEEL_DELTA as i16), None);
+        assert_eq!(touchpad_pinch_delta(false, true, WHEEL_DELTA as i16), None);
+        assert_eq!(
+            touchpad_pinch_delta(true, true, -(WHEEL_DELTA as i16)),
+            Some(-0.04)
+        );
     }
 }
 

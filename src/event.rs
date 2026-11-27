@@ -289,7 +289,9 @@ pub enum WindowEvent {
     ///
     /// ## Platform-specific
     ///
-    /// - Only available on **macOS** and **iOS**.
+    /// - On **Windows**, available when the event loop thread successfully registers as
+    ///   touchpad-capable (Windows 11 or later).
+    /// - On **macOS** and **iOS**, available natively.
     /// - On iOS, not recognized by default. It must be enabled when needed.
     PinchGesture {
         device_id: DeviceId,
