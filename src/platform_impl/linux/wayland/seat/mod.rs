@@ -11,6 +11,7 @@ use sctk::reexports::client::protocol::wl_touch::WlTouch;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 use sctk::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
+use wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1;
 
 use sctk::data_device_manager::data_device::DataDevice;
 use sctk::seat::pointer::{ThemeSpec, ThemedPointer};
@@ -28,6 +29,7 @@ mod pointer;
 mod text_input;
 mod touch;
 
+pub use pointer::pointer_gesture::{PointerGestureData, PointerGesturesState};
 pub use pointer::relative_pointer::RelativePointerState;
 pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
 pub use text_input::{
@@ -56,6 +58,9 @@ pub struct WinitSeatState {
 
     /// The relative pointer bound on the seat.
     relative_pointer: Option<ZwpRelativePointerV1>,
+
+    /// PdfCraft patch: the pinch gesture bound to this seat's pointer.
+    pointer_gesture_pinch: Option<ZwpPointerGesturePinchV1>,
 
     /// The keyboard bound on the seat.
     keyboard_state: Option<KeyboardState>,
@@ -136,6 +141,14 @@ impl SeatHandler for WinitState {
                     )
                 });
 
+                seat_state.pointer_gesture_pinch = self.pointer_gestures.as_ref().map(|manager| {
+                    manager.0.get_pinch_gesture(
+                        themed_pointer.pointer(),
+                        queue_handle,
+                        PointerGestureData::default(),
+                    )
+                });
+
                 let themed_pointer = Arc::new(themed_pointer);
 
                 // Register cursor surface.
@@ -164,6 +177,17 @@ impl SeatHandler for WinitState {
         seat: WlSeat,
         capability: SeatCapability,
     ) {
+        // Cancel before borrowing the seat, since cancellation queues a window event.
+        if matches!(capability, SeatCapability::Pointer) {
+            let gesture =
+                self.seats.get_mut(&seat.id()).and_then(|seat| seat.pointer_gesture_pinch.take());
+            if let Some(gesture) = gesture {
+                if let Some(data) = gesture.data::<PointerGestureData>() {
+                    data.cancel(self);
+                }
+                gesture.destroy();
+            }
+        }
         let seat_state = match self.seats.get_mut(&seat.id()) {
             Some(seat_state) => seat_state,
             None => {
@@ -240,6 +264,14 @@ impl SeatHandler for WinitState {
     ) {
         // W15 (winit#4729): end a file drag in progress on this seat; W2 (winit#4747): the text
         // input is destroyed only here, when the seat itself goes away.
+        let removed_pointer_gesture =
+            self.seats.get_mut(&seat.id()).and_then(|seat| seat.pointer_gesture_pinch.take());
+        if let Some(gesture) = removed_pointer_gesture {
+            if let Some(data) = gesture.data::<PointerGestureData>() {
+                data.cancel(self);
+            }
+            gesture.destroy();
+        }
         self.cancel_file_drag(&seat.id());
         self.clipboard.remove_seat(&seat.id());
         let removed_text_input =

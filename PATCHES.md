@@ -223,3 +223,62 @@ cross-compilation checks for Windows x86_64 GNU and macOS AArch64. Cross-compila
 execute native tests. The main-thread AppKit harness, Windows native message/IMM tests, live
 XIM/Wayland input methods, matching egui adapter and downstream custom editors remain separate
 qualification gates. Human review and merge are required.
+
+## W16 subset: native Wayland pinch
+
+### Upstream reference and adaptation
+
+The upstream reference is rust-windowing/winit#4338, merged as
+`3be30affe42c3d30c7bc9620e7d32635cfc47bac` (PR head
+`78b07e5ae392c131a9f656b2e22f23b5930c6989`). Its gesture implementation is
+`winit-wayland/src/seat/pointer/pointer_gesture.rs`. This is an adapted pinch-only
+backport, not a clean cherry-pick: upstream uses the split 0.31 window stack and
+also delivers pan and rotation; this port targets Craft 0.30.13.
+
+The adaptation keeps the optional version-1 protocol binding, two-finger and
+top-level-surface checks, and started/moved/ended/cancelled phases. It replaces
+upstream scale subtraction with differences of logarithms because egui-winit
+exponentiates the delta. A small production `PinchState` helper rejects invalid
+scales and impossible jumps and makes cancellation/reset behavior testable.
+Closed windows, poisoned locks and unknown events are handled without introducing
+panic paths. Pointer and seat teardown preserve the Craft fork's newer drag/IME
+handling. Rotation, swipe and pan are intentionally not backported.
+
+The production change is confined to the pointer gesture helper/policy, their
+seat/state wiring and event documentation. No scroll or modifier handling is
+added by the pinch dispatcher. Keep that scope when rebasing this patch.
+
+PR #20 ports the pinch-only candidate from storytold/pdfcraft#1580 onto the resolved
+Craft fork. It optionally binds pointer-gestures-v1, converts cumulative compositor
+scales to logarithmic incremental `PinchGesture` deltas and cancels gestures on pointer
+or seat removal without replacing the newer drag/IME teardown. Rotation and swipe
+remain outside this cut. Remove the port when an upstream 0.30-compatible release
+provides equivalent pinch delivery and scale/lifecycle handling.
+
+2026-10-31 automated validation: 207 library tests and four `wayland_pinch` regressions passed with
+`--no-default-features --features wayland,rwh_06`; strict Clippy passed for the library
+and that test target. Current PdfCraft 0.16.1 also passed four egui integration tests
+with this port applied to its actual Git dependency. Live hardware validation was
+not repeated for this update.
+
+### 2026-11-01 GNOME/Wayland validation
+
+The contributor exercised PdfCraft `c9470fb0` with the actual pinned winit dependency
+`0bc1a9b7` on NixOS 26.05 and GNOME Shell 50.5, using a fresh isolated profile and a
+synthetic one-page PDF. They confirmed pinch zoom in both directions, unchanged
+application menu/toolbar size (only PDF content scales), and ordinary two-finger
+scrolling after the pinch.
+
+Two completed `WAYLAND_DEBUG=client` captures contained 17 pinch begin/end pairs,
+987 updates, and two compositor cancellations. Both captured scales below and above
+1.0. The compositor advertised pointer-gestures version 3; the client bound version
+1 and created its pinch object. No `wl_pointer.axis` event occurred between any
+pinch begin/end pair; 284 axis events occurred outside those intervals. Together
+with the pinch dispatcher's lack of scroll/modifier synthesis, this shows no
+duplicate Ctrl-scroll zoom path in these GNOME samples. It does not establish that
+behavior on every compositor or under every modifier combination.
+
+KDE and Sway were not tested. Physical pointer-capability/seat removal and a live
+compositor without pointer-gestures remain untested; scale/reset/cancellation policy
+is covered by the automated tests. Raw traces and the synthetic fixture are local
+verification artifacts, not repository assets.
