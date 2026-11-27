@@ -31,7 +31,7 @@ use super::cursor::cursor_from_icon;
 use super::monitor::{self, flip_window_screen_coordinates, get_display_id};
 use super::observer::RunLoop;
 use super::view::WinitView;
-use super::window::WinitWindow;
+use super::window::{WinitPanel, WinitWindow};
 use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId};
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
@@ -56,6 +56,7 @@ pub struct PlatformSpecificWindowAttributes {
     pub tabbing_identifier: Option<String>,
     pub option_as_alt: OptionAsAlt,
     pub borderless_game: bool,
+    pub panel: bool,
 }
 
 impl Default for PlatformSpecificWindowAttributes {
@@ -74,6 +75,7 @@ impl Default for PlatformSpecificWindowAttributes {
             tabbing_identifier: None,
             option_as_alt: Default::default(),
             borderless_game: false,
+            panel: false,
         }
     }
 }
@@ -567,14 +569,31 @@ fn new_window(
             masks |= NSWindowStyleMask::FullSizeContentView;
         }
 
-        let window: Option<Retained<WinitWindow>> = unsafe {
-            msg_send_id![
-                super(mtm.alloc().set_ivars(())),
-                initWithContentRect: frame,
-                styleMask: masks,
-                backing: NSBackingStoreType::NSBackingStoreBuffered,
-                defer: false,
-            ]
+        let window: Option<Retained<WinitWindow>> = if attrs.platform_specific.panel {
+            // The utility title bar exists only on panels; a panel never miniaturizes.
+            masks = (masks | NSWindowStyleMask::UtilityWindow) & !NSWindowStyleMask::Miniaturizable;
+            let panel: Option<Retained<WinitPanel>> = unsafe {
+                msg_send_id![
+                    super(mtm.alloc().set_ivars(())),
+                    initWithContentRect: frame,
+                    styleMask: masks,
+                    backing: NSBackingStoreType::NSBackingStoreBuffered,
+                    defer: false,
+                ]
+            };
+            // SAFETY: `WinitWindow` adds no ivars and only overrides methods `NSWindow` has, and
+            // nothing checks a window's class, so a `WinitPanel` serves wherever one is used.
+            panel.map(|panel| unsafe { Retained::cast::<WinitWindow>(panel) })
+        } else {
+            unsafe {
+                msg_send_id![
+                    super(mtm.alloc().set_ivars(())),
+                    initWithContentRect: frame,
+                    styleMask: masks,
+                    backing: NSBackingStoreType::NSBackingStoreBuffered,
+                    defer: false,
+                ]
+            }
         };
         let window = window?;
 

@@ -2,7 +2,7 @@
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::{declare_class, mutability, ClassType, DeclaredClass};
-use objc2_app_kit::{NSResponder, NSWindow};
+use objc2_app_kit::{NSPanel, NSResponder, NSWindow};
 use objc2_foundation::{MainThreadBound, MainThreadMarker, NSObject};
 
 use super::event_loop::ActiveEventLoop;
@@ -111,6 +111,29 @@ declare_class!(
             true
         }
 
+        #[method(canBecomeKeyWindow)]
+        fn can_become_key_window(&self) -> bool {
+            trace_scope!("canBecomeKeyWindow");
+            true
+        }
+    }
+);
+
+declare_class!(
+    /// A [`WinitWindow`] that is a panel (`with_panel`): the same, as an `NSPanel`.
+    #[derive(Debug)]
+    pub struct WinitPanel;
+
+    unsafe impl ClassType for WinitPanel {
+        #[inherits(NSWindow, NSResponder, NSObject)]
+        type Super = NSPanel;
+        type Mutability = mutability::MainThreadOnly;
+        const NAME: &'static str = "WinitPanel";
+    }
+
+    impl DeclaredClass for WinitPanel {}
+
+    unsafe impl WinitPanel {
         #[method(canBecomeKeyWindow)]
         fn can_become_key_window(&self) -> bool {
             trace_scope!("canBecomeKeyWindow");

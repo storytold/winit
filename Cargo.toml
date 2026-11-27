@@ -167,6 +167,7 @@ features = [
     "NSMenu",
     "NSMenuItem",
     "NSOpenGLView",
+    "NSPanel",
     "NSPasteboard",
     "NSResponder",
     "NSRunningApplication",

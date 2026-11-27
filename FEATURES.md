@@ -136,6 +136,7 @@ If your PR makes notable changes to Winit's features, please update this section
 * Hidden titlebar
 * Hidden titlebar buttons
 * Full-size content view
+* `WindowAttributesExtMacOS::with_panel` makes the window a utility panel (`NSPanel`) with the small title bar.
 * Accepts first mouse
 * Set a preferred theme and get current theme.
 
