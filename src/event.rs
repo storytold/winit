@@ -289,8 +289,14 @@ pub enum WindowEvent {
     ///
     /// ## Platform-specific
     ///
-    /// - Only available on **macOS** and **iOS**.
+    /// - Only available on **macOS**, **iOS** and **Wayland**.
     /// - On iOS, not recognized by default. It must be enabled when needed.
+    /// - On Wayland, reported for two-finger touchpad pinches when the compositor supports
+    ///   `zwp_pointer_gestures_v1`; without it nothing is reported. The protocol gives the scale
+    ///   relative to where the gesture began; `delta` is the natural log of the ratio between this
+    ///   update's scale and the previous one, so `delta.exp()` is the factor to zoom by and the
+    ///   factors multiply to the gesture's total scale. Three and four finger gestures are not
+    ///   reported.
     PinchGesture {
         device_id: DeviceId,
         /// Positive values indicate magnification (zooming in) and  negative
@@ -341,8 +347,12 @@ pub enum WindowEvent {
     ///
     /// ## Platform-specific
     ///
-    /// - Only available on **macOS** and **iOS**.
+    /// - Only available on **macOS**, **iOS** and **Wayland**.
     /// - On iOS, not recognized by default. It must be enabled when needed.
+    /// - On Wayland, reported together with the two-finger pinch gesture. The protocol gives
+    ///   degrees clockwise since the previous update; `delta` is that angle with the sign flipped,
+    ///   so positive values are counterclockwise as on the other platforms. Zero rotations are not
+    ///   reported while the fingers move.
     RotationGesture {
         device_id: DeviceId,
         /// change in rotation in degrees

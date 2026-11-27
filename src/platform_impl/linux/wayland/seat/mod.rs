@@ -9,6 +9,7 @@ use sctk::reexports::client::backend::ObjectId;
 use sctk::reexports::client::protocol::wl_seat::WlSeat;
 use sctk::reexports::client::protocol::wl_touch::WlTouch;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
+use sctk::reexports::protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1;
 use sctk::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 
@@ -28,6 +29,7 @@ mod pointer;
 mod text_input;
 mod touch;
 
+pub use pointer::gestures::PointerGesturesState;
 pub use pointer::relative_pointer::RelativePointerState;
 pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
 pub use text_input::{
@@ -56,6 +58,9 @@ pub struct WinitSeatState {
 
     /// The relative pointer bound on the seat.
     relative_pointer: Option<ZwpRelativePointerV1>,
+
+    /// The touchpad pinch gesture bound on the seat's pointer.
+    pinch_gesture: Option<ZwpPointerGesturePinchV1>,
 
     /// The keyboard bound on the seat.
     keyboard_state: Option<KeyboardState>,
@@ -136,6 +141,14 @@ impl SeatHandler for WinitState {
                     )
                 });
 
+                seat_state.pinch_gesture = self.pointer_gestures.as_ref().map(|manager| {
+                    manager.get_pinch_gesture(
+                        themed_pointer.pointer(),
+                        queue_handle,
+                        pointer::gestures::PinchGestureData::default(),
+                    )
+                });
+
                 let themed_pointer = Arc::new(themed_pointer);
 
                 // Register cursor surface.
@@ -190,6 +203,10 @@ impl SeatHandler for WinitState {
                     relative_pointer.destroy();
                 }
 
+                if let Some(pinch_gesture) = seat_state.pinch_gesture.take() {
+                    pinch_gesture.destroy();
+                }
+
                 if let Some(pointer) = seat_state.pointer.take() {
                     let pointer_data = pointer.pointer().winit_data();
 
@@ -242,8 +259,12 @@ impl SeatHandler for WinitState {
         // input is destroyed only here, when the seat itself goes away.
         self.cancel_file_drag(&seat.id());
         self.clipboard.remove_seat(&seat.id());
-        let removed_text_input =
-            self.seats.remove(&seat.id()).and_then(|mut seat| seat.text_input.take());
+        let mut removed_seat = self.seats.remove(&seat.id());
+        if let Some(pinch_gesture) = removed_seat.as_mut().and_then(|seat| seat.pinch_gesture.take())
+        {
+            pinch_gesture.destroy();
+        }
+        let removed_text_input = removed_seat.and_then(|mut seat| seat.text_input.take());
         if let Some(text_input) = removed_text_input {
             // Detach the proxy from every window that still listed it *before* sampling whether
             // it was active. A worker `set_ime_allowed` takes a window lock first, so removing it

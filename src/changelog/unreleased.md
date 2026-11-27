@@ -42,6 +42,8 @@ changelog entry.
 
 ### Added
 
+- On Wayland, report two-finger touchpad pinches as `WindowEvent::PinchGesture` and
+  `WindowEvent::RotationGesture`, through `zwp_pointer_gestures_v1`.
 - On Wayland, report `HoveredFile`, `HoveredFileCancelled` and `DroppedFile` for files dragged
   onto a window, through a `wl_data_device` bound for each seat.
 - On Wayland, add `ActiveEventLoopExtWayland::clipboard` and `platform::wayland::Clipboard`, which

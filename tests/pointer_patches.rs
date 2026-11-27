@@ -65,3 +65,34 @@ fn wayland_pixel_wheels_report_moved() {
         "axis events don't take their phase from the scroll source"
     );
 }
+
+#[test]
+fn wayland_pinch_gestures_are_bound_and_reported() {
+    // The compositor sends a pinch only to a client that binds `zwp_pointer_gestures_v1` and
+    // asks for a pinch gesture on the seat's pointer. Without it `PinchGesture` and
+    // `RotationGesture` are never reported on Wayland. Only two fingers are reported; more are
+    // left to the compositor's own shortcuts.
+    let state = source("linux/wayland/state.rs");
+    assert!(
+        state.contains("PointerGesturesState::new(globals, queue_handle)"),
+        "the pointer gestures manager isn't bound"
+    );
+    let seat = source("linux/wayland/seat/mod.rs");
+    assert!(
+        seat.contains("manager.get_pinch_gesture("),
+        "a pinch gesture isn't created for the seat's pointer"
+    );
+    assert!(
+        seat.matches("pinch_gesture.destroy()").count() >= 2,
+        "the pinch gesture isn't destroyed with the pointer and with the seat"
+    );
+    let gestures = source("linux/wayland/seat/pointer/gestures.rs");
+    for needed in [
+        "if fingers != PINCH_FINGERS",
+        "WindowEvent::PinchGesture {",
+        "WindowEvent::RotationGesture {",
+        "TouchPhase::Cancelled",
+    ] {
+        assert!(gestures.contains(needed), "`{needed}` is missing from the pinch handler");
+    }
+}
