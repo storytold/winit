@@ -996,7 +996,12 @@ impl Window {
 
     #[inline]
     pub fn set_theme(&self, theme: Option<Theme>) {
-        try_theme(self.window, theme);
+        // Kept as the window's preferred theme: `WM_SETTINGCHANGE` applies the system theme again
+        // only to a window that has none, so a theme set here outlives the next settings change.
+        // The lock is not held across `try_theme`, which sends messages to this window.
+        self.window_state_lock().preferred_theme = theme;
+        let theme = try_theme(self.window, theme);
+        self.window_state_lock().current_theme = theme;
     }
 
     #[inline]
