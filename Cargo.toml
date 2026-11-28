@@ -63,13 +63,13 @@ wayland = [
     "wayland-client",
     "wayland-backend",
     "wayland-protocols",
-    "wayland-protocols-plasma",
     "sctk",
     "ahash",
     "memmap2",
     "percent-encoding",
 ]
 wayland-dlopen = ["wayland-backend/dlopen"]
+wayland-kde-blur = ["wayland", "dep:wayland-protocols-plasma"]
 wayland-csd-adwaita = ["sctk-adwaita", "sctk-adwaita/ab_glyph"]
 wayland-csd-adwaita-crossfont = ["sctk-adwaita", "sctk-adwaita/crossfont"]
 wayland-csd-adwaita-notitle = ["sctk-adwaita"]

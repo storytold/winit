@@ -35,6 +35,32 @@ jobs:
           echo 'To check for a diff, run `typos`'
           echo 'You can find typos here: https://crates.io/crates/typos'
 
+  kde-blur-opt-in:
+    name: Check that the KDE blur protocol is opt-in
+    runs-on: ubuntu-latest
+    steps:
+    - uses: taiki-e/checkout-action@v1
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Only `wayland-kde-blur` brings in wayland-protocols-plasma
+      # The protocol XML in wayland-protocols-plasma is LGPL-2.1-or-later.
+      run: |
+        set -eu
+        plasma() {
+          tree=$(cargo tree -e normal,build --target x86_64-unknown-linux-gnu --prefix none "$@") \
+            || { echo "cargo tree $* failed"; exit 2; }
+          printf '%s\n' "$tree" | grep -q '^wayland-protocols-plasma '
+        }
+        others=$(cargo metadata --format-version 1 --no-deps \
+          | jq -r '[.packages[] | select(.name == "winit") | .features | keys[]
+                    | select(. != "default" and . != "wayland-kde-blur")] | join(",")')
+        if plasma; then echo 'the default features bring in wayland-protocols-plasma'; exit 1; fi
+        if plasma --features="$others"; then
+          echo "one of $others brings in wayland-protocols-plasma"; exit 1
+        fi
+        if ! plasma --no-default-features --features=wayland-kde-blur; then
+          echo 'wayland-kde-blur does not bring in wayland-protocols-plasma'; exit 1
+        fi
+
   tests:
     name: Test ${{ matrix.toolchain }} ${{ matrix.platform.name }}
     runs-on: ${{ matrix.platform.os }}
@@ -53,6 +79,7 @@ jobs:
           - { name: 'Linux 64bit',        target: x86_64-unknown-linux-gnu, os: ubuntu-latest,   }
           - { name: 'X11',                target: x86_64-unknown-linux-gnu, os: ubuntu-latest, options: '--no-default-features --features=x11' }
           - { name: 'Wayland',            target: x86_64-unknown-linux-gnu, os: ubuntu-latest, options: '--no-default-features --features=wayland,wayland-dlopen' }
+          - { name: 'Wayland KDE blur',   target: x86_64-unknown-linux-gnu, os: ubuntu-latest, options: '--features=wayland-kde-blur' }
           - { name: 'Android',            target: aarch64-linux-android,    os: ubuntu-latest, options: '--package=winit --features=android-native-activity', cmd: 'apk --' }
           - { name: 'Redox OS',           target: x86_64-unknown-redox,     os: ubuntu-latest,   }
           - { name: 'macOS',              target: x86_64-apple-darwin,      os: macos-latest,    }

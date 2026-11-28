@@ -13,6 +13,12 @@
 //! * `wayland-csd-adwaita` (default).
 //! * `wayland-csd-adwaita-crossfont`.
 //! * `wayland-csd-adwaita-notitle`.
+//!
+//! ## Window blur
+//!
+//! [`Window::set_blur`] uses the KDE `org_kde_kwin_blur_manager` protocol, which is compiled only
+//! with the `wayland-kde-blur` cargo feature (off by default). Without it, blur requests are
+//! ignored.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;

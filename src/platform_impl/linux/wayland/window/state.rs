@@ -28,6 +28,7 @@ use sctk::shell::WaylandSurface;
 use sctk::shm::slot::SlotPool;
 use sctk::shm::Shm;
 use sctk::subcompositor::SubcompositorState;
+#[cfg(feature = "wayland-kde-blur")]
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 
 use crate::cursor::CustomCursor as RootCustomCursor;
@@ -35,6 +36,7 @@ use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, S
 use crate::error::{ExternalError, NotSupportedError};
 use crate::platform_impl::wayland::logical_to_physical_rounded;
 use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
+#[cfg(feature = "wayland-kde-blur")]
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
 use crate::platform_impl::{PlatformCustomCursor, WindowId};
 use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
@@ -263,7 +265,9 @@ pub struct WindowState {
 
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
+    #[cfg(feature = "wayland-kde-blur")]
     blur: Option<OrgKdeKwinBlur>,
+    #[cfg(feature = "wayland-kde-blur")]
     blur_manager: Option<KWinBlurManager>,
 
     /// Whether the client side decorations have pending move operations.
@@ -304,7 +308,9 @@ impl WindowState {
             .map(|fsm| fsm.fractional_scaling(window.wl_surface(), queue_handle));
 
         Self {
+            #[cfg(feature = "wayland-kde-blur")]
             blur: None,
+            #[cfg(feature = "wayland-kde-blur")]
             blur_manager: winit_state.kwin_blur_manager.clone(),
             compositor,
             connection,
@@ -1444,6 +1450,7 @@ impl WindowState {
     }
 
     /// Make window background blurred
+    #[cfg(feature = "wayland-kde-blur")]
     #[inline]
     pub fn set_blur(&mut self, blurred: bool) {
         if blurred && self.blur.is_none() {
@@ -1457,6 +1464,15 @@ impl WindowState {
         } else if !blurred && self.blur.is_some() {
             self.blur_manager.as_ref().unwrap().unset(self.window.wl_surface());
             self.blur.take().unwrap().release();
+        }
+    }
+
+    /// Without the `wayland-kde-blur` feature, blur requests are ignored.
+    #[cfg(not(feature = "wayland-kde-blur"))]
+    #[inline]
+    pub fn set_blur(&mut self, blurred: bool) {
+        if blurred {
+            info!("Blur needs the `wayland-kde-blur` feature, unable to change blur")
         }
     }
 
@@ -1547,6 +1563,7 @@ impl WindowState {
 
 impl Drop for WindowState {
     fn drop(&mut self) {
+        #[cfg(feature = "wayland-kde-blur")]
         if let Some(blur) = self.blur.take() {
             blur.release();
         }

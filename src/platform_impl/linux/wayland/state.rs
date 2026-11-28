@@ -34,6 +34,7 @@ use crate::platform_impl::wayland::seat::{
     PointerConstraintsState, RelativePointerState, TextInputState, WinitPointerData,
     WinitPointerDataExt, WinitSeatState,
 };
+#[cfg(feature = "wayland-kde-blur")]
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
 use crate::platform_impl::wayland::types::wp_fractional_scaling::FractionalScalingManager;
 use crate::platform_impl::wayland::types::wp_viewporter::ViewporterState;
@@ -125,6 +126,7 @@ pub struct WinitState {
     pub fractional_scaling_manager: Option<FractionalScalingManager>,
 
     /// KWin blur manager.
+    #[cfg(feature = "wayland-kde-blur")]
     pub kwin_blur_manager: Option<KWinBlurManager>,
 
     /// Loop handle to re-register event sources, such as keyboard repeat.
@@ -250,6 +252,7 @@ impl WinitState {
             window_events_sink: Default::default(),
             viewporter_state,
             fractional_scaling_manager,
+            #[cfg(feature = "wayland-kde-blur")]
             kwin_blur_manager: KWinBlurManager::new(globals, queue_handle).ok(),
 
             seats,

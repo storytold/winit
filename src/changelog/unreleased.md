@@ -47,3 +47,10 @@ changelog entry.
 - On Wayland, add `ActiveEventLoopExtWayland::clipboard` and `platform::wayland::Clipboard`, which
   read and write text on the clipboard through winit's data device, so toolkits don't need to bind
   a second one.
+
+### Changed
+
+- On Wayland, window blur needs the new `wayland-kde-blur` feature, which is off by default and not
+  part of `wayland`. Without it, `Window::set_blur` and `WindowAttributes::with_blur` do nothing on
+  Wayland. The implicit `wayland-protocols-plasma` feature has been removed; enable
+  `wayland-kde-blur` instead.

@@ -77,6 +77,8 @@ If your PR makes notable changes to Winit's features, please update this section
 - **Window resize increments**: When the window gets resized, the application can choose to snap the window's
   size to specific values.
 - **Window transparency**: Winit allows the creation of windows with a transparent background.
+- **Window blur**: Winit can ask the system to blur the background of a transparent window. On Wayland
+  this needs the `wayland-kde-blur` feature and a compositor with `org_kde_kwin_blur_manager`.
 - **Window maximization**: The windows created by winit can be maximized upon creation.
 - **Window maximization toggle**: The windows created by winit can be maximized and unmaximized after
   creation.

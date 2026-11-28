@@ -1,6 +1,7 @@
 //! Wayland protocol implementation boilerplate.
 
 pub mod cursor;
+#[cfg(feature = "wayland-kde-blur")]
 pub mod kwin_blur;
 pub mod wp_fractional_scaling;
 pub mod wp_viewporter;
